@@ -123,10 +123,16 @@ def _fft_invert_characteristic_function(phi, n: int = N_DENSITY, dx: float = DX_
     against a closed-form density (scipy.stats.norm.pdf) before it is
     trusted on a Lévy density that does not integrate to 1 on its own.
     """
-    du = 2 * np.pi / (n * dx)
-    u = (np.arange(n) - n // 2) * du
-    x = (np.arange(n) - n // 2) * dx
-    phi_u = phi(u)
+    du = 2 * np.pi / (n * dx)  # Fourier-grid spacing implied by the space-grid spacing
+    u = (np.arange(n) - n // 2) * du  # frequency grid, centred at u=0
+    x = (np.arange(n) - n // 2) * dx  # space grid (log-return values), centred at x=0
+    phi_u = phi(u)  # evaluate the characteristic function at every frequency-grid point
+    # ifftshift moves the zero-frequency term back to index 0 (FFT's convention)
+    # before the transform, fftshift moves the zero-space term back to the
+    # centre afterward -- this pair is what makes the discrete sum equal the
+    # continuous inversion integral on a grid centred at 0 instead of introducing
+    # a spurious index-dependent phase. np.real drops FFT roundoff's tiny
+    # imaginary part (the true answer is real since phi is a valid char. fn.).
     density = (du / (2 * np.pi)) * np.real(
         np.fft.fftshift(np.fft.fft(np.fft.ifftshift(phi_u)))
     )
@@ -148,6 +154,8 @@ def levy_density_grid(Cn, Cp, G, M, Yn, Yp, Wn, Wp, n: int = N_DENSITY, dx: floa
     """
 
     def phi(u):
+        # exp(psi(u)) is the characteristic function E[e^{iuX}] at dt=1 --
+        # psi_cgmyw returns the LOG of it (the Levy exponent), so exponentiate.
         return np.exp(psi_cgmyw(u, Cn, Cp, G, M, Yn, Yp, Wn, Wp))
 
     return _fft_invert_characteristic_function(phi, n=n, dx=dx)
@@ -170,14 +178,19 @@ def normalize_to_pdf(x, levy_density):
     optimizer path (ad_weighted_objective) catch this and return +inf.
     """
     x = np.asarray(x, dtype=float)
+    # Floor before integrating: FFT roundoff can leave a handful of grid points
+    # very slightly negative (they should be exactly 0), and a negative value
+    # flowing into a later log/divide would produce a silent NaN.
     clipped = np.clip(np.asarray(levy_density, dtype=float), DENSITY_FLOOR, None)
-    integral = float(np.trapezoid(clipped, x))
+    integral = float(np.trapezoid(clipped, x))  # total probability mass on the grid
     if not np.isfinite(integral) or integral <= 0.0:
+        # A degenerate density (e.g. from an optimizer probe near a pole) --
+        # let the caller (ad_weighted_objective) turn this into +inf.
         raise ValueError(
             f"non-normalizable density: raw integral={integral!r} is not "
             "strictly positive and finite"
         )
-    pdf = clipped / integral
+    pdf = clipped / integral  # rescale so the density now integrates to exactly 1
     return x, pdf, integral
 
 
@@ -192,10 +205,16 @@ def model_tail_probabilities(pdf_x, pdf, thresholds):
     thresholds = np.atleast_1d(np.asarray(thresholds, dtype=float))
     probs = np.empty_like(thresholds)
     for i, t in enumerate(thresholds):
+        # Convention: for a positive threshold, "tail" means "above it"
+        # (upper/right tail); for a negative threshold, "below it" (lower/left
+        # tail) -- matches empirical_tail_probabilities' convention exactly, so
+        # model vs. empirical values are directly comparable per threshold.
         if t >= 0:
             mask = pdf_x > t
         else:
             mask = pdf_x < t
+        # Integrate the PDF over just the masked tail region -- 0.0 if the
+        # threshold falls entirely outside the grid's support (empty mask).
         probs[i] = float(np.trapezoid(pdf[mask], pdf_x[mask])) if np.any(mask) else 0.0
     return probs
 
@@ -257,24 +276,38 @@ def ad_weighted_objective(theta, returns, thresholds=THRESHOLD_GRID):
     entire optimizer trajectory silently.
     """
     try:
+        # theta's order must match PARAM_ORDER/P_BOUNDS exactly -- this unpack
+        # is the one place that ordering actually gets consumed.
         Cn, Cp, G, M, Yn, Yp, Wn, Wp = theta
+        # Step 1: this candidate parameter vector -> a raw (not-yet-normalized) density.
         x, raw_density = levy_density_grid(Cn, Cp, G, M, Yn, Yp, Wn, Wp)
         if not np.all(np.isfinite(raw_density)):
+            # psi_cgmyw hit a pole (e.g. Yn==1, or Wn+Yn an integer) -- reject
+            # this point rather than let a NaN reach the optimizer.
             return np.inf
+        # Step 2: normalize into a proper PDF (raises ValueError on a
+        # degenerate density, caught below and converted to +inf).
         pdf_x, pdf, norm_const = normalize_to_pdf(x, raw_density)
         if not np.isfinite(norm_const) or norm_const <= 0.0:
             return np.inf
         if not np.all(np.isfinite(pdf)):
             return np.inf
 
+        # Step 3: model vs. empirical tail probabilities at the same thresholds.
         p_model = model_tail_probabilities(pdf_x, pdf, thresholds)
         p_empirical = empirical_tail_probabilities(returns, thresholds)
+        # Step 4: AD-weighted squared error -- weights push the loss toward
+        # matching the extreme thresholds tightly, at the cost of caring less
+        # about thresholds near the median.
         weights = ad_weight(p_empirical)
         loss = float(np.sum(weights * (p_model - p_empirical) ** 2))
         if not np.isfinite(loss):
             return np.inf
         return loss
     except (ValueError, FloatingPointError, ZeroDivisionError):
+        # Catches normalize_to_pdf's explicit raise plus any stray numeric
+        # error from an extreme/degenerate theta -- always +inf, never let an
+        # exception propagate up into scipy.optimize.minimize.
         return np.inf
 
 
@@ -301,6 +334,10 @@ def trailing_window_returns(dates, closes, end_date, window: int = 252):
     dates = np.asarray(dates, dtype=float)
     closes = np.asarray(closes, dtype=float)
 
+    # searchsorted(..., side="right") - 1 finds the rightmost index whose date
+    # is <= end_date -- i.e. "the most recent trading day at or before the
+    # requested date," which also correctly handles end_date not being an
+    # exact match (e.g. a weekend/holiday).
     idx = int(np.searchsorted(dates, end_date, side="right")) - 1
     if idx < 0:
         raise ValueError(
@@ -308,8 +345,11 @@ def trailing_window_returns(dates, closes, end_date, window: int = 252):
             f"{dates[0]!r}; no trailing window exists"
         )
 
-    available = idx + 1
-    take = min(window, available)
+    available = idx + 1  # how many trading days exist at or before end_date
+    take = min(window, available)  # D-04: min(252, available) -- the expanding-window rule
+    # Slice backward from idx: [idx-take+1, idx] inclusive, i.e. the `take`
+    # most recent days ending exactly at idx. This is always a contiguous
+    # block of real rows -- never padded, never interpolated.
     window_dates = dates[idx - take + 1 : idx + 1]
     window_closes = closes[idx - take + 1 : idx + 1]
     assert len(window_dates) == take, (
@@ -317,7 +357,7 @@ def trailing_window_returns(dates, closes, end_date, window: int = 252):
         "(D-04's 'never synthetic history' clause)"
     )
 
-    returns = np.diff(np.log(window_closes))
+    returns = np.diff(np.log(window_closes))  # `take` closes -> `take - 1` log returns
     if len(returns) < MIN_RETURNS:
         raise ValueError(
             f"trailing window ending {end_date!r} yields only {len(returns)} "
@@ -402,9 +442,13 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
             "to fit the P-measure against malformed data"
         )
 
-    thresholds = compute_threshold_grid(returns)
-    bounds = [P_BOUNDS[name] for name in PARAM_ORDER]
+    thresholds = compute_threshold_grid(returns)  # D-11: this window's own empirical quantiles
+    bounds = [P_BOUNDS[name] for name in PARAM_ORDER]  # bounds list in the fixed param order
 
+    # Build all n_starts initial guesses up front: start 0 is the fixed
+    # central seed, the rest are seeded log-uniform draws -- same rng
+    # instance across all of them, so re-running with the same seed
+    # reproduces the exact same starting points every time.
     rng = np.random.default_rng(seed)
     starts: list[tuple[float, ...]] = [
         tuple(_CENTRAL_START[name] for name in PARAM_ORDER)
@@ -415,6 +459,9 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
     records = []
     accepted = []
     for i, x0 in enumerate(starts):
+        # Run L-BFGS-B from this one starting point -- bounds enforce the
+        # theoretical/practical parameter ranges directly during optimization,
+        # not just as a post-hoc filter.
         result = minimize(
             ad_weighted_objective,
             x0=np.array(x0, dtype=float),
@@ -423,6 +470,11 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
             bounds=bounds,
         )
         fun = float(result.fun)
+        # A start only counts as "accepted" if all three hold: scipy itself
+        # reports success, the final objective/params are finite (not the
+        # +inf a pole would produce), and every param actually sits inside
+        # its bound (L-BFGS-B can occasionally return something just outside
+        # due to floating-point boundary handling).
         in_bounds = all(lo <= v <= hi for v, (lo, hi) in zip(result.x, bounds))
         finite = np.isfinite(fun) and bool(np.all(np.isfinite(result.x)))
         accepted_start = bool(result.success) and finite and in_bounds
@@ -437,7 +489,7 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
             "finite": finite,
             "accepted": accepted_start,
         }
-        records.append(record)
+        records.append(record)  # kept regardless of acceptance, for the failure-diagnostics message
         if accepted_start:
             accepted.append(record)
 
@@ -457,9 +509,17 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
             lines.append(f"  start {r['start_index']}: " + ("; ".join(reasons) or "unknown rejection"))
         raise RuntimeError("\n".join(lines))
 
+    # Among every accepted start, take the one with the lowest AD-weighted
+    # objective (D-07) -- with 8 different starting points, the multi-start
+    # protects against L-BFGS-B settling into a bad local optimum from any
+    # single starting guess.
     best = min(accepted, key=lambda r: r["fun"])
     params = dict(zip(PARAM_ORDER, best["x"]))
 
+    # A fitted value sitting right at a P_BOUNDS edge didn't actually
+    # converge to an interior optimum -- it just ran into the wall. That's
+    # not necessarily wrong, but it's a signal worth surfacing rather than
+    # reporting silently as an ordinary converged fit.
     for name, val in params.items():
         lo, hi = P_BOUNDS[name]
         if abs(val - lo) < 1e-6 or abs(val - hi) < 1e-6:

@@ -20,6 +20,7 @@ import csv
 import datetime
 import logging
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 
@@ -91,23 +92,30 @@ def daily_close_series(outmm):
     """
     dates = outmm[:, COL["date"]]
     spot = outmm[:, COL["spot"]]
+    # np.unique sorts and dedupes the date column; first_idx[i] is the row
+    # index of the FIRST occurrence of uniq_dates[i] in the original array.
     uniq_dates, first_idx = np.unique(dates, return_index=True)
 
     # Cheap guard: spot must be bit-exact constant within each unique date.
     # Vectorized via a stable sort + reduceat rather than an O(N*D) per-date
     # boolean-mask scan, which is too slow at real-file scale (N ~ 1.16M rows).
-    sort_idx = np.argsort(dates, kind="stable")
+    sort_idx = np.argsort(dates, kind="stable")  # group same-date rows contiguously
     sorted_dates = dates[sort_idx]
     sorted_spot = spot[sort_idx]
+    # For each unique date, find where its group starts in the sorted array --
+    # reduceat then applies max/min over each [start_i, start_{i+1}) run.
     group_starts = np.searchsorted(sorted_dates, uniq_dates)
     group_max = np.maximum.reduceat(sorted_spot, group_starts)
     group_min = np.minimum.reduceat(sorted_spot, group_starts)
+    # If spot were truly constant within every date, max-min is 0 for every
+    # group; take the worst (largest) spread across all dates as one number.
     max_spread = float(np.max(group_max - group_min))
     assert max_spread == 0.0, (
         f"spot price is not constant within every unique date (max spread {max_spread}); "
         "daily_close_series's first-of-date shortcut is unsafe for this file"
     )
 
+    # Safe now to take just the first row per date as "the" close for that date.
     closes = spot[first_idx]
     log_returns = np.diff(np.log(closes))
     return uniq_dates, closes, log_returns
@@ -125,8 +133,17 @@ def exclude_nan_iv(outmm):
 def yyyymmdd_to_date(value):
     """Convert a float yyyymmdd encoding (scalar or array) to datetime.date."""
     if np.isscalar(value):
-        v = int(value)
+        # np.isscalar() proves this branch only reaches numeric scalars at
+        # runtime, but it isn't a type-narrowing check the type checker
+        # understands -- cast() tells it what we already know to be true here
+        # (numpy's own scalar-conversion stubs are otherwise wide enough to
+        # nominally include complex/str/bytes, which int()/float() reject).
+        v = int(round(float(cast(float, value))))
+        # Decode yyyymmdd by integer division/modulo: year is everything above
+        # the last 4 digits, month is the next 2, day is the last 2.
         return datetime.date(v // 10000, (v // 100) % 100, v % 100)
+    # Array path: recurse element-by-element and re-box as an object array of
+    # datetime.date (there's no vectorized date dtype that keeps this cheap).
     return np.array(
         [yyyymmdd_to_date(v) for v in np.asarray(value).ravel()], dtype=object
     )
@@ -171,7 +188,10 @@ def fetch_yfinance_close_series(ticker, start, end, _downloader=None):
     if hasattr(close, "columns"):
         # download() with multi_level_index=True (the default, even for a single
         # ticker) returns a DataFrame here, not a Series -- take the one column.
-        close = close.iloc[:, 0]
+        # pandas-stubs types raw["Close"] as always-Series, so this branch is a
+        # real runtime possibility the type checker can't see; the hasattr guard
+        # is the correct dynamic check, hence the explicit suppression below.
+        close = close.iloc[:, 0]  # pyright: ignore[reportCallIssue, reportArgumentType]
 
     close = close.dropna()
     if len(close) == 0:
@@ -226,12 +246,18 @@ def load_crsp_returns(path: str | Path = DEFAULT_CRSP_PATH):
     n_negative_prc = 0
 
     with path.open(newline="") as f:
+        # DictReader keys each row by its header-name, not column position --
+        # this is what makes the loader tolerant of the export's extra/unused
+        # columns (HdrCUSIP, Ticker, PERMCO) and their exact order.
         reader = csv.DictReader(f)
         for row in reader:
             permno_raw = row.get("PERMNO")
             if permno_raw is not None:
-                permnos.add(permno_raw.strip())
+                permnos.add(permno_raw.strip())  # collected for the single-security check below
 
+            # DlyRetMissFlg is CRSP's authoritative missing-data signal in this
+            # CIZ-format export -- any non-"NA" value means "don't trust DlyRet
+            # for this row," so skip it before even trying to parse the return.
             missflag = (row.get("DlyRetMissFlg") or "").strip()
             if missflag and missflag.upper() != "NA":
                 n_dropped_missflag += 1
@@ -246,6 +272,10 @@ def load_crsp_returns(path: str | Path = DEFAULT_CRSP_PATH):
                 n_dropped_parse += 1
                 continue
 
+            # Negative DlyPrc is CRSP's own marker for a bid/ask-midpoint price
+            # standing in for a day with no actual closing trade -- not bad data,
+            # just take the magnitude (the sign carries no separate information
+            # we use downstream).
             if prc < 0:
                 n_negative_prc += 1
             prc = abs(prc)
@@ -336,8 +366,14 @@ def daily_close_series_for_pfit(
     never initiates a live network fetch purely to cross-check a series that
     already succeeded.
     """
+    # Always load the WRDS options-file series up front -- it's local (zero
+    # network), cheap, and needed both as tier 3's own fallback and as tier
+    # 1/2's cross-check reference, so there's no scenario where it's wasted work.
     wrds_dates, wrds_closes, wrds_log_returns = daily_close_series(outmm)
 
+    # Default the yfinance fetch window to the WRDS file's own date span when
+    # the caller doesn't specify one, so all three sources cover comparable
+    # ranges (only matters if tier 2 or the yfinance cross-check actually runs).
     if start is None or end is None:
         wrds_dates_as_dates = [yyyymmdd_to_date(d) for d in wrds_dates]
         if start is None:
@@ -345,11 +381,13 @@ def daily_close_series_for_pfit(
         if end is None:
             end = max(wrds_dates_as_dates)
 
-    # Tier 1: CRSP
+    # --- Tier 1: CRSP (primary, per ADR-0006 second revision) ---
     crsp_result = None
     try:
         c_dates, c_prc, c_log_returns = load_crsp_returns(crsp_path)
         if len(c_dates) < _MIN_POINTS:
+            # File exists and parsed, but doesn't clear the rolling-window
+            # floor -- treat exactly like a failure and fall through to tier 2.
             logger.warning(
                 "load_crsp_returns(%s): only %d points (< %d floor), trying fallback",
                 crsp_path, len(c_dates), _MIN_POINTS,
@@ -357,13 +395,21 @@ def daily_close_series_for_pfit(
         else:
             crsp_result = (c_dates, c_prc, c_log_returns)
     except FileNotFoundError as e:
+        # Expected/common case: the user hasn't exported the CRSP CSV yet.
         logger.warning("load_crsp_returns unavailable (%s), trying fallback", e)
     except ValueError as e:
+        # e.g. the multi-PERMNO guard tripped -- wrong WRDS query was run.
         logger.warning("load_crsp_returns parse failure (%s), trying fallback", e)
 
     if crsp_result is not None:
         dates, prc, log_returns = crsp_result
+        # Cross-check against WRDS is always free (both already in memory,
+        # no network) -- run it unconditionally when CRSP succeeds.
         _cross_check(dates, log_returns, wrds_dates, wrds_log_returns, "crsp", "wrds_fallback")
+        # Only cross-check against yfinance too if a _downloader was injected
+        # (i.e. we're in a test, or the caller explicitly opted in) -- never
+        # trigger a live network call purely to double-check a source that
+        # already succeeded; plan 01-03 needs the whole pipeline to work offline.
         if _downloader is not None:
             try:
                 y_dates, _y_closes, y_log_returns = fetch_yfinance_close_series(
@@ -374,7 +420,7 @@ def daily_close_series_for_pfit(
                 logger.warning("yfinance cross-check fetch failed: %s", e)
         return dates, prc, log_returns, "crsp"
 
-    # Tier 2: yfinance
+    # --- Tier 2: yfinance (first fallback + cross-check) ---
     try:
         y_dates, y_closes, y_log_returns = fetch_yfinance_close_series(
             ticker, start, end, _downloader=_downloader
@@ -389,5 +435,7 @@ def daily_close_series_for_pfit(
     except Exception as e:  # noqa: BLE001 - any fetch failure falls through to tier 3
         logger.warning("fetch_yfinance_close_series failed (%s), falling back to wrds", e)
 
-    # Tier 3: WRDS options-file spot column
+    # --- Tier 3: WRDS options-file spot column (last resort) ---
+    # No further fallback below this -- if it got here, the WRDS series
+    # (already loaded above) is what the P-fit gets, unconditionally.
     return wrds_dates, wrds_closes, wrds_log_returns, "wrds_fallback"
