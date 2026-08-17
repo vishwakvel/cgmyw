@@ -28,6 +28,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "network: hits a real external network service, skipped by default",
+    "slow: multi-start optimizer runs, part of the default suite but flagged for future selective skipping",
 ]
 addopts = "-q -m 'not network'"
 

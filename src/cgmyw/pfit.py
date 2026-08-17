@@ -1,0 +1,485 @@
+"""The P-measure fit: Anderson-Darling-weighted tail-probability matching
+(PFIT-01/02/03), per ADR-0005 -- corrected 2026-08-07 from the originally
+planned characteristic-function MLE.
+
+Method (ADR-0005): compute empirical exceedance probabilities from the
+observed daily log returns at a grid of thresholds; compute the model's tail
+probabilities by normalizing the CGMYW Lévy density into a proper
+probability density -- Lévy densities do NOT integrate to 1 on their own,
+and skipping or botching this step is Dr. Madan's own flagged pitfall -- and
+integrating past each threshold; fit by least-squares matching, weighted by
+`1/(p(1-p))` so the extreme tails dominate the loss over the center (the
+whole point of a tail-risk model).
+
+Note on the normalization step in *this* implementation: psi_cgmyw is a
+correctly compensated Lévy-Khintchine exponent (psi(0) == 0 exactly, per
+01-01's MODEL-01 gate), so exp(psi(u))'s Fourier inversion is already very
+close to a normalized PDF -- the residual gap normalize_to_pdf corrects is
+FFT grid truncation/aliasing error (RESEARCH.md Pitfall 7, empirically up to
+~1e-4 for in-bounds parameters on this grid), not literally "the Lévy
+density has infinite mass" (that describes the Lévy *measure* ν(dx), a
+different object from what gets FFT-inverted here). The correction step is
+still required and cheap insurance regardless of the magnitude: an
+optimizer excursion near a bound or a badly-conditioned draw could widen
+that gap, and normalize_to_pdf is the one place that gets checked.
+
+Module constants
+-----------------
+N_DENSITY, DX_DENSITY: the inverse-FFT grid. n=2**14, dx=2.5e-4 give a
+    log-return half-width of n*dx/2 = 2.048 (about +/-205% in one day, far
+    past any real observation, so truncation cannot bite) at a resolution of
+    0.025% per grid point. The induced Fourier spacing is
+    du = 2*pi/(n*dx) ~= 1.534 with u_max ~= 1.26e4, wide enough for the
+    exp(-c*|u|**Y) tail of the CGMYW characteristic function to decay before
+    truncation for Y down to about 0.3.
+DENSITY_FLOOR: 1e-300, the clip applied before any log/divide inside
+    normalize_to_pdf, so FFT roundoff producing a tiny negative value cannot
+    propagate into the tail-probability integral as a NaN.
+MIN_RETURNS: 60. Eight free parameters fitted to fewer than 60 daily
+    observations is not a defensible estimate (D-04/PFIT-02's fail-fast
+    principle, applied to insufficient data just as it applies to
+    non-convergence).
+MULTISTART_SEED: fixes the multi-start L-BFGS-B draws (D-07/T-02-06) so a
+    reported parameter estimate is reproducible -- an unseeded multi-start
+    makes reproducibility, a stated property of a defensible fit, impossible.
+THRESHOLD_GRID: a module-level default threshold grid computed once (at
+    import time) from a fixed synthetic representative return sample, so
+    ad_weighted_objective has a sane default for standalone use/testing.
+    D-11 requires the *real* threshold grid to be built from empirical
+    quantiles of each window's own return sample, not a fixed hardcoded
+    set -- fit_p_measure does this itself via compute_threshold_grid(returns)
+    and passes the window-specific grid explicitly, rather than relying on
+    this default. Thresholds close to the median get a large p(1-p)
+    denominator and thus small AD weight, which is intentional -- the whole
+    point is de-emphasizing the center.
+P_BOUNDS: L-BFGS-B bounds per RESEARCH.md assumption A4, applied
+    independently per tail. Each Y* interval is deliberately a single
+    continuous span across the pole at 1.0 rather than two split intervals
+    -- landing exactly on 1.0 has probability zero under a continuous
+    optimizer, and ad_weighted_objective's +inf guard handles the near-pole
+    region. Do not "fix" this later by splitting the interval.
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.optimize import minimize
+
+from .model import psi_cgmyw
+
+N_DENSITY: int = 2**14
+DX_DENSITY: float = 2.5e-4
+DENSITY_FLOOR: float = 1e-300
+MIN_RETURNS: int = 60
+MULTISTART_SEED: int = 20260805
+
+P_BOUNDS: dict[str, tuple[float, float]] = {
+    "Cn": (1e-4, 50.0),
+    "Cp": (1e-4, 50.0),
+    "G": (1e-3, 100.0),
+    "M": (1e-3, 100.0),
+    "Yn": (0.02, 1.98),
+    "Yp": (0.02, 1.98),
+    "Wn": (1e-3, 50.0),
+    "Wp": (1e-3, 50.0),
+}
+# Fixed parameter order (Cn, Cp, G, M, Yn, Yp, Wn, Wp) -- pinned in exactly
+# one place since psi_cgmyw, ad_weighted_objective, and fit_p_measure all
+# depend on the same ordering.
+PARAM_ORDER: tuple[str, ...] = tuple(P_BOUNDS.keys())
+
+# Central multi-start seed (start 0 of 8) -- a plausible-magnitude in-bounds
+# guess, well clear of every documented pole (Wn+Yn = 0.4+0.6 = 1.0 would be
+# the pole; 0.42+0.6 = 1.02 is not).
+_CENTRAL_START: dict[str, float] = dict(
+    Cn=1.0, Cp=1.0, G=12.0, M=15.0, Yn=0.6, Yp=0.6, Wn=0.42, Wp=0.42
+)
+
+# Default quantiles for compute_threshold_grid (D-11): 1/2/5/10/90/95/98/99th
+# percentiles of the return sample, spanning the realistic tail range without
+# per-stock tuning.
+DEFAULT_THRESHOLD_QUANTILES: tuple[float, ...] = (
+    0.01, 0.02, 0.05, 0.10, 0.90, 0.95, 0.98, 0.99,
+)
+
+
+def _fft_invert_characteristic_function(phi, n: int = N_DENSITY, dx: float = DX_DENSITY):
+    """Centred inverse-FFT: given a characteristic function phi(u), return
+    (x, density) approximating density(x) = (1/2pi) * integral phi(u)
+    exp(-i*u*x) du on a grid.
+
+    du = 2*pi/(n*dx); u = (arange(n) - n//2) * du; x = (arange(n) - n//2)*dx.
+    The ifftshift/fftshift pair is what makes this the correct centred DFT
+    pair for that integral convention; a plain np.fft.fft without it
+    introduces an index-dependent phase error that looks like a smeared or
+    shifted density.
+
+    This is the single FFT-inversion code path shared by levy_density_grid
+    (a CGMYW-specific caller) and, independently, by the test suite's own
+    Gaussian characteristic-function closure -- gating the FFT machinery
+    against a closed-form density (scipy.stats.norm.pdf) before it is
+    trusted on a Lévy density that does not integrate to 1 on its own.
+    """
+    du = 2 * np.pi / (n * dx)
+    u = (np.arange(n) - n // 2) * du
+    x = (np.arange(n) - n // 2) * dx
+    phi_u = phi(u)
+    density = (du / (2 * np.pi)) * np.real(
+        np.fft.fftshift(np.fft.fft(np.fft.ifftshift(phi_u)))
+    )
+    return x, density
+
+
+def levy_density_grid(Cn, Cp, G, M, Yn, Yp, Wn, Wp, n: int = N_DENSITY, dx: float = DX_DENSITY):
+    """Raw (NOT yet a probability density) CGMYW Lévy density on a grid,
+    via the centred inverse-FFT of exp(psi_cgmyw(u, ...)) at dt=1.
+
+    Unlike an MLE approach's exp(dt*psi(u)), this is the raw Lévy-density
+    inversion at dt=1 -- the tail-matching method's own normalization step
+    (normalize_to_pdf), not a dt scaling, is what turns this into a
+    comparable probability object.
+
+    Returns (x, density) WITHOUT normalizing or flooring -- that is
+    normalize_to_pdf's job, kept separate so the test suite can prove the
+    raw output genuinely is not a PDF before trusting the correction.
+    """
+
+    def phi(u):
+        return np.exp(psi_cgmyw(u, Cn, Cp, G, M, Yn, Yp, Wn, Wp))
+
+    return _fft_invert_characteristic_function(phi, n=n, dx=dx)
+
+
+def normalize_to_pdf(x, levy_density):
+    """Normalize a raw Lévy density into a proper probability density.
+
+    Lévy densities do not integrate to 1 by construction (ADR-0005; flagged
+    directly by Dr. Madan as easy to get wrong) -- skipping this step, or
+    normalizing incorrectly, silently invalidates every downstream tail
+    probability. Clips to DENSITY_FLOOR before integrating (FFT roundoff can
+    produce tiny negative values), integrates via trapezoid, and divides by
+    that integral.
+
+    Returns (x, pdf, normalization_constant) where pdf integrates to 1
+    within tolerance and normalization_constant (the raw integral divided
+    out) is positive and finite. Raises ValueError if the raw density is
+    degenerate (non-finite or non-positive integral) -- callers in the hot
+    optimizer path (ad_weighted_objective) catch this and return +inf.
+    """
+    x = np.asarray(x, dtype=float)
+    clipped = np.clip(np.asarray(levy_density, dtype=float), DENSITY_FLOOR, None)
+    integral = float(np.trapezoid(clipped, x))
+    if not np.isfinite(integral) or integral <= 0.0:
+        raise ValueError(
+            f"non-normalizable density: raw integral={integral!r} is not "
+            "strictly positive and finite"
+        )
+    pdf = clipped / integral
+    return x, pdf, integral
+
+
+def model_tail_probabilities(pdf_x, pdf, thresholds):
+    """Model tail probabilities P(X>t) for t>=0, P(X<t) for t<0, one per
+    threshold, integrated (trapezoid) over the masked tail of a normalized
+    PDF. A plain per-threshold loop rather than a single broadcast integral,
+    since each threshold's tail mask is a different length -- with only
+    8-ish thresholds per call this is not a hot-loop concern."""
+    pdf_x = np.asarray(pdf_x, dtype=float)
+    pdf = np.asarray(pdf, dtype=float)
+    thresholds = np.atleast_1d(np.asarray(thresholds, dtype=float))
+    probs = np.empty_like(thresholds)
+    for i, t in enumerate(thresholds):
+        if t >= 0:
+            mask = pdf_x > t
+        else:
+            mask = pdf_x < t
+        probs[i] = float(np.trapezoid(pdf[mask], pdf_x[mask])) if np.any(mask) else 0.0
+    return probs
+
+
+def empirical_tail_probabilities(returns, thresholds):
+    """Empirical tail probabilities computed directly from the sample, same
+    convention as model_tail_probabilities: P(return>t) for t>=0,
+    P(return<t) for t<0. Pure numpy, no special functions."""
+    returns = np.asarray(returns, dtype=float)
+    thresholds = np.atleast_1d(np.asarray(thresholds, dtype=float))
+    probs = np.empty_like(thresholds)
+    for i, t in enumerate(thresholds):
+        if t >= 0:
+            probs[i] = np.mean(returns > t)
+        else:
+            probs[i] = np.mean(returns < t)
+    return probs
+
+
+def ad_weight(p_empirical):
+    """Anderson-Darling weight 1/(p(1-p)), the mechanism that overweights
+    the extreme tails relative to the center (ADR-0005). p is clamped into
+    [1e-6, 1-1e-6] before the weight: an observed 0-or-1 empirical tail
+    probability at a threshold is a small-sample artifact, not infinite
+    information. Exposed standalone so its tail-vs-center behavior can be
+    unit tested in isolation, not just inferred from a fit result."""
+    p = np.clip(np.asarray(p_empirical, dtype=float), 1e-6, 1 - 1e-6)
+    return 1.0 / (p * (1 - p))
+
+
+def compute_threshold_grid(returns, quantiles=DEFAULT_THRESHOLD_QUANTILES):
+    """Build a threshold grid from empirical quantiles of a return sample
+    (D-11) -- keeps the grid meaningful across different windows/stocks
+    without per-stock tuning, rather than a fixed hardcoded set."""
+    returns = np.asarray(returns, dtype=float)
+    return np.quantile(returns, quantiles)
+
+
+# A fixed synthetic representative sample (not real data -- pfit.py has no
+# import-time dependency on data.py or any file on disk) gives
+# THRESHOLD_GRID a deterministic default value for ad_weighted_objective's
+# signature and standalone testing.
+_REPRESENTATIVE_SAMPLE = np.random.default_rng(MULTISTART_SEED).normal(0.0, 0.02, 5000)
+THRESHOLD_GRID: np.ndarray = compute_threshold_grid(_REPRESENTATIVE_SAMPLE)
+
+
+def ad_weighted_objective(theta, returns, thresholds=THRESHOLD_GRID):
+    """Anderson-Darling-weighted tail-probability-matching objective
+    (ADR-0005). theta = (Cn, Cp, G, M, Yn, Yp, Wn, Wp).
+
+    Returns +inf (never NaN) whenever: an exception is raised while
+    evaluating the density (ValueError/FloatingPointError/ZeroDivisionError
+    -- e.g. from normalize_to_pdf's own degeneracy check), the raw or
+    normalized density contains a non-finite value, or the resulting loss
+    itself is non-finite. This is the mechanism that lets L-BFGS-B step
+    cleanly away from the Yn/Yp in {0,1} and integer-Wn+Yn/Wp+Yp poles
+    (psi_cgmyw deliberately does not trap these -- see model.py) and from
+    non-normalizable densities. Returning NaN instead would corrupt the
+    entire optimizer trajectory silently.
+    """
+    try:
+        Cn, Cp, G, M, Yn, Yp, Wn, Wp = theta
+        x, raw_density = levy_density_grid(Cn, Cp, G, M, Yn, Yp, Wn, Wp)
+        if not np.all(np.isfinite(raw_density)):
+            return np.inf
+        pdf_x, pdf, norm_const = normalize_to_pdf(x, raw_density)
+        if not np.isfinite(norm_const) or norm_const <= 0.0:
+            return np.inf
+        if not np.all(np.isfinite(pdf)):
+            return np.inf
+
+        p_model = model_tail_probabilities(pdf_x, pdf, thresholds)
+        p_empirical = empirical_tail_probabilities(returns, thresholds)
+        weights = ad_weight(p_empirical)
+        loss = float(np.sum(weights * (p_model - p_empirical) ** 2))
+        if not np.isfinite(loss):
+            return np.inf
+        return loss
+    except (ValueError, FloatingPointError, ZeroDivisionError):
+        return np.inf
+
+
+def trailing_window_returns(dates, closes, end_date, window: int = 252):
+    """The trailing P-fit window: min(252, available trading days) ending at
+    end_date (D-04, ADR-0003). An expanding window until 252 days
+    accumulate, never synthetic or extrapolated history -- the returned
+    window is always a contiguous slice of the input dates/closes, never
+    padded or interpolated.
+
+    AAPL's 667-day history means every plausible date in this phase gets a
+    full 252-day window -- the fallback below exists for Phase 2's earlier-
+    history dates, and is exercised in this module's tests via a synthetic
+    date/close series rather than by the real AAPL run.
+
+    Locates the largest index with dates[idx] <= end_date (the most recent
+    date at or before end_date, if end_date itself is absent). Raises
+    ValueError if end_date precedes every date in the series, or if the
+    resulting window yields fewer than MIN_RETURNS returns -- eight free
+    parameters fitted to too little data is not a defensible estimate, and
+    the fail-fast principle applies to insufficient data exactly as it does
+    to non-convergence (D-08).
+    """
+    dates = np.asarray(dates, dtype=float)
+    closes = np.asarray(closes, dtype=float)
+
+    idx = int(np.searchsorted(dates, end_date, side="right")) - 1
+    if idx < 0:
+        raise ValueError(
+            f"end_date {end_date!r} is earlier than the series start "
+            f"{dates[0]!r}; no trailing window exists"
+        )
+
+    available = idx + 1
+    take = min(window, available)
+    window_dates = dates[idx - take + 1 : idx + 1]
+    window_closes = closes[idx - take + 1 : idx + 1]
+    assert len(window_dates) == take, (
+        "trailing_window_returns must return a contiguous, unpadded slice "
+        "(D-04's 'never synthetic history' clause)"
+    )
+
+    returns = np.diff(np.log(window_closes))
+    if len(returns) < MIN_RETURNS:
+        raise ValueError(
+            f"trailing window ending {end_date!r} yields only {len(returns)} "
+            f"return(s), fewer than MIN_RETURNS={MIN_RETURNS}; refusing to "
+            "fit eight parameters to too little data"
+        )
+    return window_dates, returns
+
+
+@dataclass(frozen=True)
+class PFitResult:
+    """The fitted P-measure parameters plus fit-quality diagnostics.
+
+    as_tuple() returns (Cn, Cp, G, M, Yn, Yp, Wn, Wp) for direct hand-off to
+    plan 01-03's report and, eventually, Phase 1.5's Q-calibration.
+    """
+
+    Cn: float
+    Cp: float
+    G: float
+    M: float
+    Yn: float
+    Yp: float
+    Wn: float
+    Wp: float
+    ad_objective: float
+    n_returns: int
+    window_start_date: int | None
+    window_end_date: int | None
+    starts_attempted: int
+    starts_succeeded: int
+
+    def as_tuple(self) -> tuple[float, float, float, float, float, float, float, float]:
+        return (self.Cn, self.Cp, self.G, self.M, self.Yn, self.Yp, self.Wn, self.Wp)
+
+
+def _log_uniform_draw(rng, bounds: tuple[float, float]) -> float:
+    """Log-uniform draw inside (lo, hi) -- spreads probes across the several
+    orders of magnitude the C/G/M/W parameters span far better than
+    uniform-in-level."""
+    lo, hi = bounds
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+
+def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, window_dates=None):
+    """Multi-start bounded L-BFGS-B P-fit via Anderson-Darling-weighted
+    tail-probability matching (ADR-0005, D-07/D-08/D-09).
+
+    The threshold grid is recomputed from this window's own returns
+    (compute_threshold_grid, D-11), not the module-level THRESHOLD_GRID
+    default, and passed explicitly to ad_weighted_objective for every start.
+
+    Start 0 is a fixed central seed, well clear of every documented pole;
+    starts 1..n_starts-1 are log-uniform draws inside P_BOUNDS from a
+    seeded np.random.default_rng(seed) -- seeding is load-bearing, since an
+    unseeded multi-start makes a reported parameter estimate irreproducible,
+    and reproducibility is a stated property of a defensible fit.
+
+    A start is accepted only when the optimizer reports success, the final
+    objective is finite, and every parameter component is inside P_BOUNDS.
+    Among accepted starts, the lowest objective wins (D-07). If no start is
+    accepted, raises RuntimeError enumerating all n_starts with each one's
+    rejection reason (D-08) -- no least-bad fallback, no bound-widening, no
+    retry (D-09).
+
+    Also raises ValueError up front if `returns` contains any non-finite
+    (NaN/inf) value: comparisons against NaN silently evaluate False
+    throughout empirical_tail_probabilities/model_tail_probabilities, which
+    would let a malformed input sample produce a plausible-looking (but
+    meaningless) finite loss instead of failing loudly -- fail-fast applies
+    to malformed input data exactly as it does to non-convergence (D-08).
+
+    Emits a RuntimeWarning naming any parameter within 1e-6 of its P_BOUNDS
+    edge -- a bound-pinned "convergence" is a bounds artifact, not a
+    converged optimum, and surfacing it here is what lets plan 01-03's demo
+    run notice it.
+    """
+    returns = np.asarray(returns, dtype=float)
+    if not np.all(np.isfinite(returns)):
+        raise ValueError(
+            "returns array contains non-finite (NaN/inf) values; refusing "
+            "to fit the P-measure against malformed data"
+        )
+
+    thresholds = compute_threshold_grid(returns)
+    bounds = [P_BOUNDS[name] for name in PARAM_ORDER]
+
+    rng = np.random.default_rng(seed)
+    starts: list[tuple[float, ...]] = [
+        tuple(_CENTRAL_START[name] for name in PARAM_ORDER)
+    ]
+    for _ in range(n_starts - 1):
+        starts.append(tuple(_log_uniform_draw(rng, P_BOUNDS[name]) for name in PARAM_ORDER))
+
+    records = []
+    accepted = []
+    for i, x0 in enumerate(starts):
+        result = minimize(
+            ad_weighted_objective,
+            x0=np.array(x0, dtype=float),
+            args=(returns, thresholds),
+            method="L-BFGS-B",
+            bounds=bounds,
+        )
+        fun = float(result.fun)
+        in_bounds = all(lo <= v <= hi for v, (lo, hi) in zip(result.x, bounds))
+        finite = np.isfinite(fun) and bool(np.all(np.isfinite(result.x)))
+        accepted_start = bool(result.success) and finite and in_bounds
+
+        record = {
+            "start_index": i,
+            "success": bool(result.success),
+            "message": str(result.message),
+            "fun": fun if np.isfinite(fun) else float("inf"),
+            "x": tuple(float(v) for v in result.x),
+            "in_bounds": in_bounds,
+            "finite": finite,
+            "accepted": accepted_start,
+        }
+        records.append(record)
+        if accepted_start:
+            accepted.append(record)
+
+    if not accepted:
+        lines = [
+            f"P-fit failed: none of {n_starts} L-BFGS-B starts converged to "
+            "a finite, in-bounds result. Per-start diagnostics:"
+        ]
+        for r in records:
+            reasons = []
+            if not r["success"]:
+                reasons.append(f"non-convergent ({r['message']})")
+            if not r["finite"]:
+                reasons.append("non-finite objective/parameters")
+            if not r["in_bounds"]:
+                reasons.append("out-of-bounds parameters")
+            lines.append(f"  start {r['start_index']}: " + ("; ".join(reasons) or "unknown rejection"))
+        raise RuntimeError("\n".join(lines))
+
+    best = min(accepted, key=lambda r: r["fun"])
+    params = dict(zip(PARAM_ORDER, best["x"]))
+
+    for name, val in params.items():
+        lo, hi = P_BOUNDS[name]
+        if abs(val - lo) < 1e-6 or abs(val - hi) < 1e-6:
+            warnings.warn(
+                f"P-fit parameter {name}={val!r} sits within 1e-6 of its "
+                f"P_BOUNDS edge {(lo, hi)!r} -- this is a bounds artifact, "
+                "not a converged optimum.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    window_start_date = int(window_dates[0]) if window_dates is not None else None
+    window_end_date = int(window_dates[-1]) if window_dates is not None else None
+
+    return PFitResult(
+        **params,
+        ad_objective=best["fun"],
+        n_returns=len(returns),
+        window_start_date=window_start_date,
+        window_end_date=window_end_date,
+        starts_attempted=n_starts,
+        starts_succeeded=len(accepted),
+    )
