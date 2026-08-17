@@ -10,7 +10,7 @@ An empirical research project (prof-directed) that implements a new 8-parameter 
 
 ### Constraints
 
-- **Data source**: WRDS `.dat` files remain the sole source for Q-measure/options data (no live fetching for that side). For P-measure's daily return series, the primary source is CRSP via WRDS (`RET`, dividend-inclusive and split-corrected, per the professor's 2026-08-17 guidance), with live fetching via `yfinance` (dividend/split-adjusted close) permitted as a fallback and cross-check, and the WRDS options-file spot column as a second fallback and cross-check — see ADR-0006.
+- **Data source**: WRDS `.dat` files remain the sole source for Q-measure/options data (no live fetching for that side). For P-measure's daily return series, the primary source is CRSP via WRDS (`DlyRet`, dividend-inclusive and split-corrected, per the professor's 2026-08-17 guidance), with live fetching via `yfinance` (dividend/split-adjusted close) permitted as a fallback and cross-check, and the WRDS options-file spot column as a second fallback and cross-check — see ADR-0006.
 - **Numerical**: CGMYW's characteristic exponent requires evaluating the Kummer U (confluent hypergeometric) function at complex arguments across an FFT grid; must use `scipy.special.hyperu` (handles complex input) rather than a hand-rolled series.
 - **Faithfulness to source**: The professor's email takes precedence over the summarized task brief wherever they diverge (see ADR-0002).
 - **Tooling**: Python + scipy/numpy stack (no new heavy dependencies) per prior conversation — `scipy.io.loadmat`, `scipy.optimize`, `scipy.special.hyperu`, `numpy.fft`. `yfinance` is an approved dependency in its fallback/cross-check role for the P-data source (ADR-0006) — no other new heavy dependencies.
