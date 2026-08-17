@@ -28,7 +28,9 @@ def test_kummer_u_a_zero_is_identity():
 @pytest.mark.parametrize("z_mag", [3.0, 8.0])
 def test_kummer_u_tricomi_branch_matches_mpmath(z_mag):
     mpmath = pytest.importorskip("mpmath")
-    a, b = 0.4, 1.0  # Wn=0.4, Wn+Yn=1.0 -- plausible CGMYW (W, W+Y) pair
+    # a=Wn=0.4, b=Wn+Yn=1.3 -- plausible CGMYW (W, W+Y) pair, deliberately off
+    # any integer b (RESEARCH.md Pitfall 3: gamma(1-b)/gamma(b-1) pole at b=1).
+    a, b = 0.4, 1.3
     z = z_mag + 2.0j
     assert abs(z) < KUMMER_Z_THRESHOLD  # confirm this exercises the Tricomi branch
 
@@ -41,7 +43,7 @@ def test_kummer_u_tricomi_branch_matches_mpmath(z_mag):
 @pytest.mark.parametrize("z_mag", [35.0, 80.0])
 def test_kummer_u_asymptotic_branch_matches_mpmath(z_mag):
     mpmath = pytest.importorskip("mpmath")
-    a, b = 0.4, 1.0
+    a, b = 0.4, 1.3
     z = z_mag + 2.0j
     assert abs(z) >= KUMMER_Z_THRESHOLD  # confirm this exercises the asymptotic branch
 
@@ -103,16 +105,20 @@ def test_psi_cgmyw_distinct_tail_params_differ_from_symmetric_call():
 
 
 def test_psi_cgmyw_accepts_complex_u():
+    # Wn=0.42 (not 0.4): Wn+Yn=0.4+0.6 would land exactly on the documented
+    # Tricomi-formula pole at integer b (RESEARCH.md Pitfall 3, reproduced
+    # directly: gamma(1-b)/gamma(b-1) both blow up at b=1.0, producing NaN --
+    # a real, expected singularity model.py deliberately does not trap).
     for u in (3.0 - 1.75j, -1j):
-        v = psi_cgmyw(u, 1.0, 1.2, 12.0, 15.0, 0.6, 0.55, 0.4, 0.35)
+        v = psi_cgmyw(u, 1.0, 1.2, 12.0, 15.0, 0.6, 0.55, 0.42, 0.35)
         assert np.isfinite(v)
 
 
 def test_psi_cgmyw_at_minus_i_is_real():
-    w = psi_cgmyw(-1j, 1.0, 1.2, 12.0, 15.0, 0.6, 0.55, 0.4, 0.35)
+    w = psi_cgmyw(-1j, 1.0, 1.2, 12.0, 15.0, 0.6, 0.55, 0.42, 0.35)
     assert abs(complex(w).imag) < 1e-10
 
 
 def test_psi_cgmyw_vanishes_at_origin():
-    w = psi_cgmyw(0.0, 1.0, 1.2, 12.0, 15.0, 0.6, 0.55, 0.4, 0.35)
+    w = psi_cgmyw(0.0, 1.0, 1.2, 12.0, 15.0, 0.6, 0.55, 0.42, 0.35)
     assert abs(complex(w)) < 1e-12
