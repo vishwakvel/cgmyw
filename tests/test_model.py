@@ -97,6 +97,59 @@ def test_psi_cgmyw_symmetric_reduction_matches_classical_cgmy(C, G, M, Y):
     assert max_abs_err < 1e-8
 
 
+def _psi_cgmyw_numeric(u, Cn, Cp, G, M, Yn, Yp, Wn, Wp, dps=30):
+    """psi(u) = int_{-inf}^{inf} (e^{iux} - 1) k(x) dx computed by direct
+    high-precision quadrature of the CGMYW Levy density, with no Kummer-U
+    involved. Independent ground truth for the closed form's power-tilt term.
+
+    Down tail (x<0), substituting x -> -x: int_0^inf (e^{-iux}-1) *
+    Cn e^{-Gx}/(x^{1+Yn}(1+x)^{Wn}) dx.  Up tail (x>0): int_0^inf
+    (e^{iux}-1) * Cp e^{-Mx}/(x^{1+Yp}(1+x)^{Wp}) dx.  Both integrands are
+    O(x^{-Y}) near 0, integrable for Y < 1 (kept below 1 in the callers).
+    """
+    import mpmath as mp
+
+    mp.mp.dps = dps
+    u = complex(u)
+    split = [0, mp.mpf("1e-8"), mp.mpf("1e-4"), mp.mpf("1e-2"), mp.mpf("0.1"), 1, 10, mp.inf]
+
+    def dens_down(x):
+        return Cn * mp.e ** (-G * x) / (x ** (1 + Yn) * (1 + x) ** Wn)
+
+    def dens_up(x):
+        return Cp * mp.e ** (-M * x) / (x ** (1 + Yp) * (1 + x) ** Wp)
+
+    down = mp.quad(lambda x: mp.re((mp.e ** (-1j * u * x) - 1) * dens_down(x)), split) + 1j * mp.quad(
+        lambda x: mp.im((mp.e ** (-1j * u * x) - 1) * dens_down(x)), split
+    )
+    up = mp.quad(lambda x: mp.re((mp.e ** (1j * u * x) - 1) * dens_up(x)), split) + 1j * mp.quad(
+        lambda x: mp.im((mp.e ** (1j * u * x) - 1) * dens_up(x)), split
+    )
+    return complex(down) + complex(up)
+
+
+@pytest.mark.parametrize(
+    "u,p",
+    [
+        (2.0, dict(Cn=1.0, Cp=1.3, G=9.7, M=6.2, Yn=0.6, Yp=0.7, Wn=0.5, Wp=0.9)),
+        (0.8, dict(Cn=0.7, Cp=0.7, G=12.0, M=15.0, Yn=0.4, Yp=0.55, Wn=1.0, Wp=0.3)),
+        (-1.5, dict(Cn=1.1, Cp=0.9, G=8.0, M=10.0, Yn=0.75, Yp=0.5, Wn=2.0, Wp=1.4)),
+    ],
+)
+def test_psi_cgmyw_power_tilt_matches_numerical_integration(u, p):
+    """The W != 0 correctness gate the MODEL-01 symmetric reduction cannot be:
+    at Wn=Wp=0, U(0, b, z) == 1 for every b, so that reduction passes whether
+    the Kummer-U second argument is W+Y or W+Y+1. Only a W != 0 check against
+    an independent computation of psi(u) can pin the tilt term. The printed
+    closed form's U(W, W+Y, z) is wrong by 1-10% here; U(W, W+Y+1, z) matches
+    the direct integral to ~1e-14 (well inside this 1e-6 bar).
+    """
+    pytest.importorskip("mpmath")
+    got = complex(psi_cgmyw(u, p["Cn"], p["Cp"], p["G"], p["M"], p["Yn"], p["Yp"], p["Wn"], p["Wp"]))
+    want = _psi_cgmyw_numeric(u, **p)
+    assert abs(got - want) / abs(want) < 1e-6
+
+
 def test_psi_cgmyw_distinct_tail_params_differ_from_symmetric_call():
     u = np.linspace(-50, 50, 501)
     symmetric = psi_cgmyw(u, 1.0, 1.0, 12.0, 15.0, 0.6, 0.6, 0.0, 0.0)
