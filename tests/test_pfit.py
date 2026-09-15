@@ -326,6 +326,63 @@ def test_fit_p_measure_result_fields_finite_and_inbounds():
         assert lo < val < hi
 
 
+def test_fixed_starts_are_three_distinct_pole_free_inbounds_regimes():
+    """_FIXED_STARTS: a classical-CGMY-ish guess, a near-zero-Y/large-W
+    guess (the region an independently published CGMYW fit lands in), and a
+    Y>1 guess -- each must be inside P_BOUNDS, finite under the objective
+    (not sitting on a Gamma(-Y) or Tricomi pole), and start 0 must always be
+    the original central seed regardless of how many are used."""
+    import cgmyw.pfit as pfit_module
+
+    assert len(pfit_module._FIXED_STARTS) == 3
+    assert pfit_module._FIXED_STARTS[0] is pfit_module._CENTRAL_START
+
+    sample = _sample_from_cgmyw(GOOD_PARAMS, 500, seed=7)
+    seen_low_y = False
+    seen_high_y = False
+    for fixed in pfit_module._FIXED_STARTS:
+        theta = tuple(fixed[name] for name in pfit_module.PARAM_ORDER)
+        for name, val in fixed.items():
+            lo, hi = P_BOUNDS[name]
+            assert lo < val < hi, f"{name}={val} outside P_BOUNDS {(lo, hi)}"
+        loss = ad_weighted_objective(theta, sample)
+        assert np.isfinite(loss), f"fixed start {fixed} is on a pole (+inf objective)"
+        if fixed["Yn"] < 1.0 and fixed["Yp"] < 1.0:
+            seen_low_y = True
+        if fixed["Yn"] > 1.0 and fixed["Yp"] > 1.0:
+            seen_high_y = True
+    # At least one structured start on each side of the Yn=Yp=1 Gamma(-Y)
+    # pole -- the specific gap this trio exists to cover.
+    assert seen_low_y and seen_high_y
+
+
+@pytest.mark.parametrize("n_starts", [1, 2, 3, 4])
+def test_fit_p_measure_small_n_starts_uses_fixed_seeds_first(n_starts, monkeypatch):
+    """n_starts below 3 must take just the first n_starts fixed seeds (never
+    error, never silently fall back to random draws for slots that should be
+    structured) -- start order is start 0 = _CENTRAL_START always."""
+    import cgmyw.pfit as pfit_module
+
+    captured_x0s = []
+    real_minimize = pfit_module.minimize
+
+    def spying_minimize(fun, x0, **kwargs):
+        captured_x0s.append(tuple(x0))
+        return real_minimize(fun, x0, **kwargs)
+
+    monkeypatch.setattr(pfit_module, "minimize", spying_minimize)
+    sample = _sample_from_cgmyw(GOOD_PARAMS, 500, seed=7)
+    pfit_module.fit_p_measure(sample, n_starts=n_starts)
+
+    assert len(captured_x0s) == n_starts
+    expected_fixed = [
+        tuple(fixed[name] for name in pfit_module.PARAM_ORDER)
+        for fixed in pfit_module._FIXED_STARTS[:n_starts]
+    ]
+    for got, want in zip(captured_x0s, expected_fixed):
+        assert got == want
+
+
 @pytest.mark.slow
 def test_fit_p_measure_starts_attempted_and_succeeded():
     sample = _sample_from_cgmyw(GOOD_PARAMS, 3000, seed=99)
@@ -390,11 +447,16 @@ def test_min_returns_constant_value():
 
 
 def test_compute_threshold_grid_shape():
+    # 14, not the original 8: over-identification fix (8 free params vs 8
+    # threshold conditions is exactly determined -- widened after comparing
+    # against an independently published CGMYW fit landed in a very
+    # different corner of parameter space for the same tickers).
     rng = np.random.default_rng(3)
     sample = rng.normal(0.0, 0.02, 500)
     thresholds = compute_threshold_grid(sample)
-    assert thresholds.shape == (8,)
+    assert thresholds.shape == (14,)
     assert np.all(np.isfinite(thresholds))
+    assert np.all(np.diff(thresholds) > 0)  # strictly increasing, no duplicate quantiles
 
 
 def test_n_density_constant():

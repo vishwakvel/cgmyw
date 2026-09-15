@@ -153,15 +153,20 @@ def psi_cgmyw(u, Cn, Cp, G, M, Yn, Yp, Wn, Wp):
     en = Wn + Yn  # z-exponent, down tail
     ep = Wp + Yp  # z-exponent, up tail
 
-    # Kummer-U second argument = (z-exponent) + 1. The source note's printed
-    # closed form writes U(W, W+Y, z); working phi(z) through the DLMF 13.4.4
-    # integral representation of U -- U(a,b,z)*Gamma(a) = int_0^inf e^{-zt}
-    # t^{a-1}(1+t)^{b-a-1}dt -- gives a=W and b-a-1=Y, i.e. b = W+Y+1, not
-    # W+Y. Confirmed by direct numerical integration of the defining tail
-    # integral (test_psi_cgmyw_power_tilt_matches_numerical_integration):
-    # W+Y is wrong by 1-10% once W != 0, W+Y+1 matches to ~1e-14. At W=0,
+    # Kummer-U second argument = (z-exponent) + 1. An early working draft of
+    # the source note (CGMYW.pdf, this repo) printed U(W, W+Y, z) instead;
+    # working phi(z) through the DLMF 13.4.4 integral representation of U --
+    # U(a,b,z)*Gamma(a) = int_0^inf e^{-zt} t^{a-1}(1+t)^{b-a-1}dt -- gives
+    # a=W and b-a-1=Y, i.e. b = W+Y+1, not W+Y. Confirmed three independent
+    # ways: (1) direct numerical integration of the defining tail integral
+    # (test_psi_cgmyw_power_tilt_matches_numerical_integration) -- W+Y is
+    # wrong by 1-10% once W != 0, W+Y+1 matches to ~1e-14; (2) at W=0,
     # U(0, b, z) == 1 for every b, so the classical-CGMY reduction (MODEL-01)
-    # is unchanged and could never have caught this.
+    # is unchanged either way and could never have caught this; (3) Madan &
+    # Wang, "Asset Pricing, Measure Changes, and a New Lévy Model" (Aug 2026,
+    # the finished paper introducing CGMYW), Proposition 1, prints
+    # U(Wn, Wn+Yn+1, G+iu) and U(Wp, Wp+Yp+1, M-iu) explicitly -- the
+    # published closed form matches this implementation exactly.
     bn = en + 1.0  # Kummer-U second parameter, down tail
     bp = ep + 1.0  # ... and up tail
 

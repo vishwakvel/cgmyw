@@ -91,18 +91,61 @@ P_BOUNDS: dict[str, tuple[float, float]] = {
 # depend on the same ordering.
 PARAM_ORDER: tuple[str, ...] = tuple(P_BOUNDS.keys())
 
-# Central multi-start seed (start 0 of 8) -- a plausible-magnitude in-bounds
-# guess, well clear of every documented pole (Wn+Yn = 0.4+0.6 = 1.0 would be
-# the pole; 0.42+0.6 = 1.02 is not).
+# Three structured multi-start seeds (D-07), each a plausible-magnitude
+# in-bounds guess well clear of every documented pole, chosen to give the
+# optimizer a genuine shot at three qualitatively different regions of the
+# 8-dimensional space rather than relying on log-uniform luck to find them:
+#
+# _CENTRAL_START: a "classical CGMY-ish" guess, moderate G/M, moderate Y,
+#   small W (Wn+Yn = 0.42+0.6 = 1.02, not the 1.0 pole).
+# _TAIL_HEAVY_START: near-zero Y with large G/M/W -- the corner an
+#   independently published CGMYW fit on the same ten tickers actually lands
+#   in (Madan & Wang, "Asset Pricing, Measure Changes, and a New Lévy Model",
+#   2026, Table 1; AAPL there: Yn=Yp~0.003, G~52, M~98, Wn~22.3, Wp~4.8, on a
+#   different, longer, fixed window than this project's rolling 252-day one).
+#   Our own AAPL fit on a 252-day window has so far always landed at
+#   Yn,Yp ~ 0.7-0.9 with Wn,Wp an order of magnitude smaller -- a large gap
+#   for the *same* general model and estimation family. This start exists so
+#   that gap is a genuine finding about the window/objective, not an
+#   unexplored corner of the multi-start.
+# _HIGH_Y_START: Y > 1 (infinite-variation regime), on the other side of the
+#   Gamma(-Y) pole at Y=1 from both of the above -- log-uniform draws land on
+#   either side of that pole by chance, but nothing previously guaranteed the
+#   optimizer actually explored the Y>1 side structurally.
 _CENTRAL_START: dict[str, float] = dict(
     Cn=1.0, Cp=1.0, G=12.0, M=15.0, Yn=0.6, Yp=0.6, Wn=0.42, Wp=0.42
 )
+_TAIL_HEAVY_START: dict[str, float] = dict(
+    Cn=0.5, Cp=0.5, G=50.0, M=90.0, Yn=0.05, Yp=0.05, Wn=15.0, Wp=5.0
+)
+_HIGH_Y_START: dict[str, float] = dict(
+    Cn=1.0, Cp=1.0, G=15.0, M=15.0, Yn=1.5, Yp=1.5, Wn=1.0, Wp=1.0
+)
+# Ordered so start 0 is always the original central seed (keeps
+# fit_p_measure's start-index diagnostics stable for n_starts>=1); starts 1
+# and 2 are the two additional structured regimes when n_starts>=3.
+_FIXED_STARTS: tuple[dict[str, float], ...] = (
+    _CENTRAL_START,
+    _TAIL_HEAVY_START,
+    _HIGH_Y_START,
+)
 
-# Default quantiles for compute_threshold_grid (D-11): 1/2/5/10/90/95/98/99th
-# percentiles of the return sample, spanning the realistic tail range without
-# per-stock tuning.
+# Default quantiles for compute_threshold_grid (D-11). Widened from the
+# original 8 (1/2/5/10/90/95/98/99th percentiles) to 14, adding resolution
+# between the 1st/99th (kept as the outermost points -- more extreme than
+# that starts running out of data at a 252-day window, ~2-3 points at the
+# 1st percentile already) and the median. Motivation: 8 free parameters
+# matched against exactly 8 threshold conditions is exactly determined, the
+# textbook recipe for a non-unique fit -- confirmed empirically, not just in
+# the abstract, by the gap against the independently published AAPL fit
+# noted above (same general method, very different parameter values, both
+# presumably tracking their own tail data reasonably). More conditions than
+# parameters (over-identification) is the standard fix; it does not
+# guarantee a unique optimum but gives the loss less freedom to be
+# indifferent between very different parameter vectors.
 DEFAULT_THRESHOLD_QUANTILES: tuple[float, ...] = (
-    0.01, 0.02, 0.05, 0.10, 0.90, 0.95, 0.98, 0.99,
+    0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15,
+    0.85, 0.90, 0.925, 0.95, 0.97, 0.98, 0.99,
 )
 
 
@@ -410,11 +453,23 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
     (compute_threshold_grid, D-11), not the module-level THRESHOLD_GRID
     default, and passed explicitly to ad_weighted_objective for every start.
 
-    Start 0 is a fixed central seed, well clear of every documented pole;
-    starts 1..n_starts-1 are log-uniform draws inside P_BOUNDS from a
-    seeded np.random.default_rng(seed) -- seeding is load-bearing, since an
+    Starts 0-2 are the fixed, structured seeds in _FIXED_STARTS -- a
+    classical-CGMY-ish guess, a near-zero-Y/large-G,M,W guess (the region an
+    independently published fit of this same model landed in for the same
+    tickers), and a Y>1 guess on the other side of the Gamma(-Y) pole -- each
+    well clear of every documented pole. Remaining starts (n_starts-3, or all
+    of them if n_starts<3, in which case only the first n_starts fixed seeds
+    are used) are log-uniform draws inside P_BOUNDS from a seeded
+    np.random.default_rng(seed) -- seeding is load-bearing, since an
     unseeded multi-start makes a reported parameter estimate irreproducible,
     and reproducibility is a stated property of a defensible fit.
+
+    `returns` is used as-is, not de-meaned: the model has no separate drift
+    parameter, so whatever mean the fitted (Cn,Cp,G,M,Yn,Yp,Wn,Wp) imply is
+    an output of the fit, not something stripped out beforehand. This is
+    deliberate, not an oversight -- the source note frames the P-fit as
+    carrying a drift that is "then risk-neutralized" in the Q-step, which
+    only makes sense if that drift survives the P-fit.
 
     A start is accepted only when the optimizer reports success, the final
     objective is finite, and every parameter component is inside P_BOUNDS.
@@ -445,15 +500,18 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
     thresholds = compute_threshold_grid(returns)  # D-11: this window's own empirical quantiles
     bounds = [P_BOUNDS[name] for name in PARAM_ORDER]  # bounds list in the fixed param order
 
-    # Build all n_starts initial guesses up front: start 0 is the fixed
-    # central seed, the rest are seeded log-uniform draws -- same rng
-    # instance across all of them, so re-running with the same seed
-    # reproduces the exact same starting points every time.
+    # Build all n_starts initial guesses up front: the first min(n_starts, 3)
+    # are the fixed, structured seeds in _FIXED_STARTS (in order, so start 0
+    # is always _CENTRAL_START regardless of n_starts); any remaining starts
+    # are seeded log-uniform draws -- same rng instance across all of them,
+    # so re-running with the same seed reproduces the exact same starting
+    # points every time.
     rng = np.random.default_rng(seed)
     starts: list[tuple[float, ...]] = [
-        tuple(_CENTRAL_START[name] for name in PARAM_ORDER)
+        tuple(fixed[name] for name in PARAM_ORDER) for fixed in _FIXED_STARTS[:n_starts]
     ]
-    for _ in range(n_starts - 1):
+    n_random = max(0, n_starts - len(starts))
+    for _ in range(n_random):
         starts.append(tuple(_log_uniform_draw(rng, P_BOUNDS[name]) for name in PARAM_ORDER))
 
     records = []
