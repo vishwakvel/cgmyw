@@ -29,9 +29,10 @@ N_DENSITY, DX_DENSITY: the inverse-FFT grid. n=2**14, dx=2.5e-4 give a
     log-return half-width of n*dx/2 = 2.048 (about +/-205% in one day, far
     past any real observation, so truncation cannot bite) at a resolution of
     0.025% per grid point. The induced Fourier spacing is
-    du = 2*pi/(n*dx) ~= 1.534 with u_max ~= 1.26e4, wide enough for the
-    exp(-c*|u|**Y) tail of the CGMYW characteristic function to decay before
-    truncation for Y down to about 0.3.
+    du = 2*pi/(n*dx) ~= 1.534 with u_max ~= 1.26e4. Checked against a 16x
+    larger, 10x finer grid: tail probabilities agree to ~1e-5 across the
+    bounds, including the published Y ~ 0.003 fits
+    (test_tail_probabilities_converged_on_default_grid).
 DENSITY_FLOOR: 1e-300, the clip applied before any log/divide inside
     normalize_to_pdf, so FFT roundoff producing a tiny negative value cannot
     propagate into the tail-probability integral as a NaN.
@@ -67,6 +68,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.special import gamma
 
 from .model import psi_cgmyw
 
@@ -79,10 +81,13 @@ MULTISTART_SEED: int = 20260805
 P_BOUNDS: dict[str, tuple[float, float]] = {
     "Cn": (1e-4, 50.0),
     "Cp": (1e-4, 50.0),
-    "G": (1e-3, 100.0),
-    "M": (1e-3, 100.0),
-    "Yn": (0.02, 1.98),
-    "Yp": (0.02, 1.98),
+    # G/M up to 300 and Y down to 1e-3: Madan & Wang's published fits on the
+    # same ten tickers (Table 1) have M up to ~132 and Y down to ~2e-4, which
+    # the original (G,M <= 100, Y >= 0.02) box could not reach.
+    "G": (1e-3, 300.0),
+    "M": (1e-3, 300.0),
+    "Yn": (1e-3, 1.98),
+    "Yp": (1e-3, 1.98),
     "Wn": (1e-3, 50.0),
     "Wp": (1e-3, 50.0),
 }
@@ -103,8 +108,9 @@ PARAM_ORDER: tuple[str, ...] = tuple(P_BOUNDS.keys())
 #   in (Madan & Wang, "Asset Pricing, Measure Changes, and a New Lévy Model",
 #   2026, Table 1; AAPL there: Yn=Yp~0.003, G~52, M~98, Wn~22.3, Wp~4.8, on a
 #   different, longer, fixed window than this project's rolling 252-day one).
-#   Our own AAPL fit on a 252-day window has so far always landed at
-#   Yn,Yp ~ 0.7-0.9 with Wn,Wp an order of magnitude smaller -- a large gap
+#   Our own AAPL fits on 252-day windows land in different regimes window
+#   to window (Y ~ 1.67 symmetric on 2023-01-13; Yn ~ 0.15 / Yp ~ 0.86 on
+#   2025-08-29; see ADR-0008) -- a large gap
 #   for the *same* general model and estimation family. This start exists so
 #   that gap is a genuine finding about the window/objective, not an
 #   unexplored corner of the multi-start.
@@ -238,28 +244,21 @@ def normalize_to_pdf(x, levy_density):
 
 
 def model_tail_probabilities(pdf_x, pdf, thresholds):
-    """Model tail probabilities P(X>t) for t>=0, P(X<t) for t<0, one per
-    threshold, integrated (trapezoid) over the masked tail of a normalized
-    PDF. A plain per-threshold loop rather than a single broadcast integral,
-    since each threshold's tail mask is a different length -- with only
-    8-ish thresholds per call this is not a hot-loop concern."""
+    """Model tail probabilities P(X>t) for t>=0, P(X<t) for t<0 (same
+    convention as empirical_tail_probabilities), from a normalized PDF.
+
+    Built from the cumulative-trapezoid CDF, interpolated at each exact
+    threshold. Integrating a mask that starts at the first grid point past t
+    instead drops the sliver [t, next grid point] -- up to dx * pdf(t), about
+    0.005 at dx = 2.5e-4 near the center of a daily-return density, which is
+    as large as the fit's own RMSE.
+    """
     pdf_x = np.asarray(pdf_x, dtype=float)
     pdf = np.asarray(pdf, dtype=float)
     thresholds = np.atleast_1d(np.asarray(thresholds, dtype=float))
-    probs = np.empty_like(thresholds)
-    for i, t in enumerate(thresholds):
-        # Convention: for a positive threshold, "tail" means "above it"
-        # (upper/right tail); for a negative threshold, "below it" (lower/left
-        # tail) -- matches empirical_tail_probabilities' convention exactly, so
-        # model vs. empirical values are directly comparable per threshold.
-        if t >= 0:
-            mask = pdf_x > t
-        else:
-            mask = pdf_x < t
-        # Integrate the PDF over just the masked tail region -- 0.0 if the
-        # threshold falls entirely outside the grid's support (empty mask).
-        probs[i] = float(np.trapezoid(pdf[mask], pdf_x[mask])) if np.any(mask) else 0.0
-    return probs
+    cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(pdf_x))])
+    at_t = np.interp(thresholds, pdf_x, cdf)  # P(X < t), 0 / total mass outside the grid
+    return np.where(thresholds >= 0, cdf[-1] - at_t, at_t)
 
 
 def empirical_tail_probabilities(returns, thresholds):
@@ -437,6 +436,32 @@ class PFitResult:
         return (self.Cn, self.Cp, self.G, self.M, self.Yn, self.Yp, self.Wn, self.Wp)
 
 
+def _variance_matched(start: dict[str, float], variance: float) -> tuple[float, ...]:
+    """Rescale a seed's Cn, Cp so its variance per unit time is `variance`.
+
+    The fixed seeds fix the *shape* (G, M, Y, W); their C values are only
+    right for one return scale, and a seed off by 10x in variance sits on a
+    plateau where every tail probability saturates and L-BFGS-B stops at
+    once. Variance uses the CGMY moment C*Gamma(2-Y)*G^(Y-2) per side with
+    the tilt folded in as G+W ((1+x)^-W ~ e^-Wx where the variance lives) --
+    an approximation, good enough for a starting point.
+    """
+    s = dict(start)
+    per_unit_c = gamma(2 - s["Yn"]) * (s["G"] + s["Wn"]) ** (s["Yn"] - 2) + gamma(2 - s["Yp"]) * (
+        s["M"] + s["Wp"]
+    ) ** (s["Yp"] - 2)
+    s["Cn"] = s["Cp"] = float(np.clip(variance / per_unit_c, *P_BOUNDS["Cn"]))
+    return tuple(s[name] for name in PARAM_ORDER)
+
+
+def _log_ad_objective(z, returns, thresholds):
+    """ad_weighted_objective in log-parameter space. Parameters span 1e-3..1e2
+    (C ~ 1e-2, G ~ 1e2), so a level-space finite-difference gradient is
+    badly scaled: on AAPL the level-space fit returned its seed G=50, M=90,
+    W=15 essentially unchanged. In log space every coordinate is relative."""
+    return ad_weighted_objective(np.exp(z), returns, thresholds)
+
+
 def _log_uniform_draw(rng, bounds: tuple[float, float]) -> float:
     """Log-uniform draw inside (lo, hi) -- spreads probes across the several
     orders of magnitude the C/G/M/W parameters span far better than
@@ -452,6 +477,9 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
     The threshold grid is recomputed from this window's own returns
     (compute_threshold_grid, D-11), not the module-level THRESHOLD_GRID
     default, and passed explicitly to ad_weighted_objective for every start.
+
+    Optimization runs on log(theta) (_log_ad_objective) and each fixed
+    seed's Cn, Cp are rescaled to the sample variance (_variance_matched).
 
     Starts 0-2 are the fixed, structured seeds in _FIXED_STARTS -- a
     classical-CGMY-ish guess, a near-zero-Y/large-G,M,W guess (the region an
@@ -499,6 +527,7 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
 
     thresholds = compute_threshold_grid(returns)  # D-11: this window's own empirical quantiles
     bounds = [P_BOUNDS[name] for name in PARAM_ORDER]  # bounds list in the fixed param order
+    log_bounds = [(np.log(lo), np.log(hi)) for lo, hi in bounds]  # the optimizer works on log(theta)
 
     # Build all n_starts initial guesses up front: the first min(n_starts, 3)
     # are the fixed, structured seeds in _FIXED_STARTS (in order, so start 0
@@ -508,7 +537,7 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
     # points every time.
     rng = np.random.default_rng(seed)
     starts: list[tuple[float, ...]] = [
-        tuple(fixed[name] for name in PARAM_ORDER) for fixed in _FIXED_STARTS[:n_starts]
+        _variance_matched(fixed, float(np.var(returns))) for fixed in _FIXED_STARTS[:n_starts]
     ]
     n_random = max(0, n_starts - len(starts))
     for _ in range(n_random):
@@ -520,29 +549,40 @@ def fit_p_measure(returns, n_starts: int = 8, seed: int = MULTISTART_SEED, windo
         # Run L-BFGS-B from this one starting point -- bounds enforce the
         # theoretical/practical parameter ranges directly during optimization,
         # not just as a post-hoc filter.
+        z0 = np.log(np.array(x0, dtype=float))
+        start_fun = float(_log_ad_objective(z0, returns, thresholds))
         result = minimize(
-            ad_weighted_objective,
-            x0=np.array(x0, dtype=float),
+            _log_ad_objective,
+            x0=z0,
             args=(returns, thresholds),
             method="L-BFGS-B",
-            bounds=bounds,
+            bounds=log_bounds,
         )
         fun = float(result.fun)
-        # A start only counts as "accepted" if all three hold: scipy itself
-        # reports success, the final objective/params are finite (not the
-        # +inf a pole would produce), and every param actually sits inside
-        # its bound (L-BFGS-B can occasionally return something just outside
-        # due to floating-point boundary handling).
-        in_bounds = all(lo <= v <= hi for v, (lo, hi) in zip(result.x, bounds))
+        # A start only counts as "accepted" if all three hold: it converged,
+        # the final objective/params are finite (not the +inf a pole would
+        # produce), and every param actually sits inside its bound (L-BFGS-B
+        # can occasionally return something just outside due to
+        # floating-point boundary handling). "Converged" includes L-BFGS-B's
+        # ABNORMAL line-search stop when it improved on its start: that stop
+        # is finite-difference gradient noise at the bottom of a basin (on
+        # AAPL it was the best start), whereas a stop that never left its
+        # start is a plateau and stays rejected.
+        in_bounds = all(lo <= v <= hi for v, (lo, hi) in zip(result.x, log_bounds))
         finite = np.isfinite(fun) and bool(np.all(np.isfinite(result.x)))
-        accepted_start = bool(result.success) and finite and in_bounds
+        # Back to level space; clip absorbs exp(log(bound)) round-off.
+        theta = np.clip(np.exp(result.x), *np.array(bounds).T) if finite else result.x
+        converged = bool(result.success) or (
+            "ABNORMAL" in str(result.message) and np.isfinite(fun) and fun < start_fun
+        )
+        accepted_start = converged and finite and in_bounds
 
         record = {
             "start_index": i,
             "success": bool(result.success),
             "message": str(result.message),
             "fun": fun if np.isfinite(fun) else float("inf"),
-            "x": tuple(float(v) for v in result.x),
+            "x": tuple(float(v) for v in theta),
             "in_bounds": in_bounds,
             "finite": finite,
             "accepted": accepted_start,

@@ -323,6 +323,18 @@ def load_crsp_returns(path: str | Path = DEFAULT_CRSP_PATH):
     return dates, prc, log_returns
 
 
+def total_return_index(log_returns):
+    """A price-like series whose log differences are exactly `log_returns`
+    (index starts at 1.0, length len(log_returns) + 1).
+
+    This, not CRSP's DlyPrc, is what trailing_window_returns must window:
+    DlyPrc is not dividend-adjusted, so np.diff(np.log(DlyPrc)) silently
+    drops every dividend that ln(1 + DlyRet) includes (ADR-0006). Aligned
+    with load_crsp_returns' `dates` (index[i] sits on dates[i]).
+    """
+    return np.exp(np.concatenate([[0.0], np.cumsum(np.asarray(log_returns, dtype=float))]))
+
+
 def _cross_check(dates_a, log_returns_a, dates_b, log_returns_b, name_a, name_b):
     """Soft cross-check: Pearson correlation of log returns on overlapping
     dates. Disagreement always logs a warning, never raises (ADR-0006)."""

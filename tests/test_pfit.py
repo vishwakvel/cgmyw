@@ -375,8 +375,9 @@ def test_fit_p_measure_small_n_starts_uses_fixed_seeds_first(n_starts, monkeypat
     pfit_module.fit_p_measure(sample, n_starts=n_starts)
 
     assert len(captured_x0s) == n_starts
+    # x0 is in log space, with each seed's Cn, Cp variance-matched to the sample.
     expected_fixed = [
-        tuple(fixed[name] for name in pfit_module.PARAM_ORDER)
+        tuple(np.log(pfit_module._variance_matched(fixed, float(np.var(sample)))))
         for fixed in pfit_module._FIXED_STARTS[:n_starts]
     ]
     for got, want in zip(captured_x0s, expected_fixed):
@@ -429,7 +430,7 @@ def test_fit_p_measure_warns_when_param_near_bound():
     pinned = [pfit_module.P_BOUNDS[name][0] + 1e-9 for name in pfit_module.PARAM_ORDER]
 
     def fake_minimize(fun, x0, args, method, bounds):
-        return _FakeResult(pinned)
+        return _FakeResult(np.log(pinned))  # the optimizer works in log space
 
     monkeypatch_targets = pfit_module.minimize
     try:
@@ -459,5 +460,41 @@ def test_compute_threshold_grid_shape():
     assert np.all(np.diff(thresholds) > 0)  # strictly increasing, no duplicate quantiles
 
 
+def test_variance_matched_seed_hits_sample_variance_scale():
+    """The seed rescaling must put each fixed start at the sample's return
+    scale -- otherwise L-BFGS-B starts on a saturated plateau and stops."""
+    import cgmyw.pfit as pfit_module
+
+    rng = np.random.default_rng(5)
+    for sd in (0.01, 0.03):
+        returns = rng.normal(0.0, sd, 2000)
+        theta = pfit_module._variance_matched(pfit_module._CENTRAL_START, float(returns.var()))
+        x, raw = levy_density_grid(*theta)
+        x, pdf, _ = normalize_to_pdf(x, raw)
+        model_var = np.trapezoid(x**2 * pdf, x) - np.trapezoid(x * pdf, x) ** 2
+        assert 0.5 < model_var / returns.var() < 2.0
+
+
 def test_n_density_constant():
     assert N_DENSITY == 2**14
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        GOOD_PARAMS,
+        (0.9515, 1.3436, 51.983, 97.634, 0.0030, 0.0031, 22.269, 4.8288),  # Madan & Wang Table 1 AAPL
+        (0.006954, 0.006556, 26.88, 40.87, 0.9477, 0.9507, 0.4222, 0.4238),  # our 2025-08-29 AAPL fit
+    ],
+)
+def test_tail_probabilities_converged_on_default_grid(params):
+    """Default-grid tail probabilities must match a 16x larger, 10x finer grid.
+    Guards the threshold-sliver bug (masking from the first grid point past t
+    was off by up to 0.005) and the tiny-Y end of P_BOUNDS."""
+    th = np.array([-0.05, -0.03, -0.02, -0.01, 0.01, 0.02, 0.03, 0.05])
+    probs = []
+    for n, dx in [(2**14, 2.5e-4), (2**18, 2.5e-5)]:
+        x, raw = levy_density_grid(*params, n=n, dx=dx)
+        x, pdf, _ = normalize_to_pdf(x, raw)
+        probs.append(model_tail_probabilities(x, pdf, th))
+    np.testing.assert_allclose(probs[0], probs[1], atol=5e-5)

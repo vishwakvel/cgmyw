@@ -314,3 +314,16 @@ def test_pfit_resolver_crsp_tier_with_valid_cross_check(tmp_path, aapl_outmm):
     assert source == "crsp"
     assert len(out_dates) == len(wrds_dates)
     assert len(out_log_returns) == len(wrds_dates) - 1
+
+
+def test_total_return_index_windows_back_to_exact_log_returns():
+    """Windowing the total-return index must reproduce ln(1+DlyRet) exactly --
+    windowing raw DlyPrc instead drops the dividend on ex-dates."""
+    from cgmyw.data import total_return_index
+    from cgmyw.pfit import trailing_window_returns
+
+    rng = np.random.default_rng(0)
+    log_returns = rng.normal(0.0, 0.02, 400)
+    dates = np.arange(401, dtype=float)
+    _, window = trailing_window_returns(dates, total_return_index(log_returns), dates[-1])
+    np.testing.assert_allclose(window, log_returns[-251:], atol=1e-12)
