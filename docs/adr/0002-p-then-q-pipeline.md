@@ -1,6 +1,6 @@
 # Follow the two-stage P-then-Q pipeline, not a Q-only calibration
 
-Status: accepted
+Status: accepted. The two-stage pipeline stands; its 5-parameter pinning detail is superseded by ADR-0004 (8 parameters) and ADR-0008 (pin Cn, Cp, Yn, Yp; Q moves G, M, Wn, Wp).
 
 The main task brief, read alone, only asks for option-data (Q-measure) calibration and a results write-up — no time series step. But the professor's email is explicit: "You can start with time series data and then move to option data." When the two sources conflicted, we deferred to the professor's email as the authoritative source over the summarized task brief.
 
