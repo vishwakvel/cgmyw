@@ -26,7 +26,10 @@ def _fmt(params) -> str:
     return "  ".join(f"{n}={v:.4g}" for n, v in zip(PARAM_ORDER, params))
 
 
-def format_report(symbol, p_fit, smile, q_fit, q_free=None) -> str:
+def format_report(symbol, p_fit, smile, q_fits: dict) -> str:
+    """q_fits: label -> QFitResult, main fit first. The martingale-only
+    measure (paper Sec. 4) is shown once, from the first fit."""
+    first = next(iter(q_fits.values()))
     lines = [
         f"=== {symbol}: P-measure (daily units, window {p_fit.window_start_date}-{p_fit.window_end_date}, "
         f"{p_fit.n_returns} returns) ===",
@@ -34,19 +37,16 @@ def format_report(symbol, p_fit, smile, q_fit, q_free=None) -> str:
         f"AD objective {p_fit.ad_objective:.5g}; starts {p_fit.starts_succeeded}/{p_fit.starts_attempted}",
         "",
         f"=== {symbol}: Q-measure (annual units; quote {smile.quote_date}, expiry {smile.expiry}, "
-        f"T={smile.T:.4f}y, {q_fit.n_options} OTM options) ===",
-        f"martingale-only (paper Sec. 4): {_fmt(q_fit.rn_params)}",
-        f"  IV RMSE {q_fit.rn_iv_rmse:.4f}; objective {q_fit.rn_objective:.5g}",
-        f"smile-calibrated, Cn/Cp/Yn/Yp pinned: {_fmt(q_fit.params)}",
-        f"  IV RMSE {q_fit.iv_rmse:.4f}; objective {q_fit.objective:.5g}; starts ok {q_fit.starts_succeeded}",
-        "  (objective = mean ((model - mid)/vega)^2, the vega-weighted price error minimized;",
-        "   it tracks IV error only to first order, so with errors this large the two can rank fits differently)",
+        f"T={smile.T:.4f}y, {first.n_options} OTM options) ===",
+        f"martingale-only (paper Sec. 4, no option data): {_fmt(first.rn_params)}",
+        f"  IV RMSE {first.rn_iv_rmse:.4f}",
     ]
-    if q_free is not None:
+    for label, q in q_fits.items():
         lines += [
-            f"unrestricted (NOT equivalent to P; restriction-cost diagnostic): {_fmt(q_free.params)}",
-            f"  IV RMSE {q_free.iv_rmse:.4f}",
+            f"{label}: {_fmt(q.params)}",
+            f"  IV RMSE {q.iv_rmse:.4f}; objective {q.objective:.5g}; starts ok {q.starts_succeeded}",
         ]
+    lines.append("(objective = mean ((model - mid)/vega)^2, the vega-weighted price error minimized)")
     return "\n".join(lines)
 
 
@@ -63,18 +63,18 @@ def plot_tail_fit(p_fit, returns, out_path, symbol: str) -> Path:
     return _save(fig, out_path)
 
 
-def plot_smile(smile, q_fit, out_path, symbol: str, q_free=None) -> Path:
-    """Market vs. model implied vols across log-moneyness."""
+def plot_smile(smile, q_fits: dict, out_path, symbol: str) -> Path:
+    """Market vs. model implied vols across log-moneyness, one line per fit."""
     k = np.log(smile.strikes / smile.F)
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(k, smile.market_iv, "ko", ms=4, label="market (mid)")
-    ax.plot(k, q_fit.model_iv, "r-", label=f"Q pinned to P (RMSE {q_fit.iv_rmse:.3f})")
-    ax.plot(k, q_fit.rn_iv, "b--", label=f"martingale-only (RMSE {q_fit.rn_iv_rmse:.3f})")
-    if q_free is not None:
-        ax.plot(k, q_free.model_iv, "g:", label=f"unrestricted (RMSE {q_free.iv_rmse:.3f})")
+    first = next(iter(q_fits.values()))
+    ax.plot(k, first.rn_iv, "b--", label=f"martingale-only (RMSE {first.rn_iv_rmse:.3f})")
+    for (label, q), style in zip(q_fits.items(), ("r-", "m-.", "g:")):
+        ax.plot(k, q.model_iv, style, label=f"{label} (RMSE {q.iv_rmse:.3f})")
     ax.set(xlabel="ln(K/F)", ylabel="implied vol",
            title=f"{symbol} {smile.quote_date} -> {smile.expiry} smile")
-    ax.legend()
+    ax.legend(fontsize=8)
     return _save(fig, out_path)
 
 

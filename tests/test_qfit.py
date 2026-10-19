@@ -9,7 +9,9 @@ from cgmyw.pricing import cgmyw_prices, implied_vols
 from cgmyw.qfit import (
     DTE_HI,
     DTE_LO,
+    C_FREE,
     MIN_MID,
+    PINNED,
     TRADING_DAYS_PER_YEAR,
     SmileData,
     annualize,
@@ -68,8 +70,30 @@ def test_calibrate_q_recovers_synthetic_free_params():
     iv = implied_vols(mid, F, K, T, df, is_call)
     smile = SmileData(20250101, 20250205, T, S0, F, df, K, is_call, mid, iv)
 
-    fit = calibrate_q(p_daily, smile, n_starts=4)
+    fit = calibrate_q(p_daily, smile, search=PINNED, n_starts=4)
     assert (fit.params[0], fit.params[1], fit.params[4], fit.params[5]) == (p_ann[0], p_ann[1], p_ann[4], p_ann[5])
+    assert martingale_drift(fit.params) == pytest.approx(target, abs=1e-8)
+    assert fit.iv_rmse < 2e-3
+
+
+def test_c_free_default_moves_c_but_keeps_y_pinned():
+    """Default Q search (Dr. Madan, 2026-10-19): Cn, Cp may move, Yn, Yp may
+    not, and the result is still a martingale. Recovers a smile priced with
+    different C than P's."""
+    p_daily = PAPER_AAPL_DAILY
+    p_ann = annualize(p_daily)
+    F, S0, T, df = 101.0, 100.0, 35 / 365, 0.996
+    target = np.log(F / S0) / T
+    truth = (0.6 * p_ann[0], 0.8 * p_ann[1], 45.0, 0.0, *p_ann[4:6], 15.0, 6.0)
+    truth = (*truth[:3], solve_m(truth, target), *truth[4:])
+    K = np.linspace(85, 115, 15)
+    is_call = K >= F
+    mid = cgmyw_prices(truth, F, df, T, K, is_call)
+    smile = SmileData(20250101, 20250205, T, S0, F, df, K, is_call, mid, implied_vols(mid, F, K, T, df, is_call))
+
+    fit = calibrate_q(p_daily, smile, n_starts=4)
+    assert C_FREE == ("Cn", "Cp", "G", "Wn", "Wp")
+    assert (fit.params[4], fit.params[5]) == (p_ann[4], p_ann[5])
     assert martingale_drift(fit.params) == pytest.approx(target, abs=1e-8)
     assert fit.iv_rmse < 2e-3
 

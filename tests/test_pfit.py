@@ -448,14 +448,12 @@ def test_min_returns_constant_value():
 
 
 def test_compute_threshold_grid_shape():
-    # 14, not the original 8: over-identification fix (8 free params vs 8
-    # threshold conditions is exactly determined -- widened after comparing
-    # against an independently published CGMYW fit landed in a very
-    # different corner of parameter space for the same tickers).
+    # 30 (15 per side, 1-45% / 55-99%): spans the whole distribution like the
+    # paper's Figure 1; the old tails-only grid never saw the body.
     rng = np.random.default_rng(3)
     sample = rng.normal(0.0, 0.02, 500)
     thresholds = compute_threshold_grid(sample)
-    assert thresholds.shape == (14,)
+    assert thresholds.shape == (30,)
     assert np.all(np.isfinite(thresholds))
     assert np.all(np.diff(thresholds) > 0)  # strictly increasing, no duplicate quantiles
 

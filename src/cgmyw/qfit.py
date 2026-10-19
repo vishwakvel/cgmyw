@@ -43,7 +43,7 @@ MIN_MID: float = 0.10
 # Carr-Madan damping integrable (needs M > alpha + 1).
 FREE: tuple[str, ...] = ("G", "M", "Wn", "Wp")
 # Annual units, like everything on the Q side: Cn/Cp are P_BOUNDS' daily
-# bounds times TRADING_DAYS_PER_YEAR (only UNRESTRICTED ever searches them).
+# bounds times TRADING_DAYS_PER_YEAR (only C_FREE / UNRESTRICTED search them).
 Q_BOUNDS: dict[str, tuple[float, float]] = {
     **P_BOUNDS,
     "Cn": (P_BOUNDS["Cn"][0] * 252.0, P_BOUNDS["Cn"][1] * 252.0),
@@ -53,10 +53,17 @@ Q_BOUNDS: dict[str, tuple[float, float]] = {
 _IDX = {n: i for i, n in enumerate(PARAM_ORDER)}
 
 # What calibrate_q searches over; M is always solved from the martingale
-# condition instead. PINNED is the paper's equivalent measure change.
-# UNRESTRICTED frees Cn, Cp, Yn, Yp too -- NOT equivalent to P; it exists
-# only to measure what the Hellinger restriction costs on a given smile.
+# condition instead.
+# - PINNED: the paper's strictly equivalent measure change (Cn, Cp, Yn, Yp
+#   at their P values). Cannot fit AAPL's skew (ADR-0008).
+# - C_FREE (the default): Cn, Cp move too, Yn, Yp stay pinned -- the
+#   relaxation of Madan & Wang's Markovian-economies paper (Sec. 3), chosen
+#   by Dr. Madan on 2026-10-19 ("keep it free for performance accuracy").
+#   Not strictly equivalent; required returns then come from eq. 36's
+#   kernel difference rather than a Radon-Nikodym density.
+# - UNRESTRICTED: Yn, Yp free as well -- a diagnostic upper bound on fit.
 PINNED: tuple[str, ...] = ("G", "Wn", "Wp")
+C_FREE: tuple[str, ...] = ("Cn", "Cp", "G", "Wn", "Wp")
 UNRESTRICTED: tuple[str, ...] = ("Cn", "Cp", "G", "Yn", "Yp", "Wn", "Wp")
 
 
@@ -235,13 +242,14 @@ def _iv_rmse(params, smile):
     return float(np.sqrt(np.nanmean((iv - smile.market_iv) ** 2))), iv
 
 
-def calibrate_q(p_daily, smile: SmileData, search: tuple[str, ...] = PINNED,
+def calibrate_q(p_daily, smile: SmileData, search: tuple[str, ...] = C_FREE,
                 n_starts: int = 6, seed: int = 20261018) -> QFitResult:
     """Fit the Q measure to the smile. `search` parameters move (log space,
     bounded Nelder-Mead, Q_BOUNDS); M is solved from the martingale condition
     T*psi(-i) = ln(F/S0) (solve_m), so every visited point is a martingale
     measure by construction; everything else stays at the annualized P value.
-    The default PINNED search is the paper's equivalent measure change.
+    Default C_FREE (Cn, Cp, G, Wn, Wp; Yn, Yp pinned) per Dr. Madan; PINNED
+    is the paper's strictly equivalent measure change.
 
     Objective: mean squared vega-weighted price error, ((model - mid)/vega)^2,
     vega taken once at the market IV -- a first-order IV-error loss without a
@@ -301,7 +309,7 @@ def calibrate_q(p_daily, smile: SmileData, search: tuple[str, ...] = PINNED,
 
 
 __all__ = [
-    "TRADING_DAYS_PER_YEAR", "Q_BOUNDS", "PINNED", "UNRESTRICTED", "SmileData", "QFitResult", "annualize",
+    "TRADING_DAYS_PER_YEAR", "Q_BOUNDS", "PINNED", "C_FREE", "UNRESTRICTED", "SmileData", "QFitResult", "annualize",
     "martingale_drift", "candidate_table", "select_date_maturity", "build_smile",
     "risk_neutralize", "solve_m", "calibrate_q",
 ]

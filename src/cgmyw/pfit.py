@@ -108,12 +108,9 @@ PARAM_ORDER: tuple[str, ...] = tuple(P_BOUNDS.keys())
 #   in (Madan & Wang, "Asset Pricing, Measure Changes, and a New Lévy Model",
 #   2026, Table 1; AAPL there: Yn=Yp~0.003, G~52, M~98, Wn~22.3, Wp~4.8, on a
 #   different, longer, fixed window than this project's rolling 252-day one).
-#   Our own AAPL fits on 252-day windows land in different regimes window
-#   to window (Y ~ 1.67 symmetric on 2023-01-13; Yn ~ 0.15 / Yp ~ 0.86 on
-#   2025-08-29; see ADR-0008) -- a large gap
-#   for the *same* general model and estimation family. This start exists so
-#   that gap is a genuine finding about the window/objective, not an
-#   unexplored corner of the multi-start.
+#   With the full-range threshold grid, our 252-day AAPL fits land in this
+#   same regime (Y ~ 0.04-0.06, Wn ~ 15 vs Wp ~ 5 on 2023-01-13 and
+#   2025-08-29); the old tails-only grid had sent them elsewhere (ADR-0008).
 # _HIGH_Y_START: Y > 1 (infinite-variation regime), on the other side of the
 #   Gamma(-Y) pole at Y=1 from both of the above -- log-uniform draws land on
 #   either side of that pole by chance, but nothing previously guaranteed the
@@ -136,22 +133,18 @@ _FIXED_STARTS: tuple[dict[str, float], ...] = (
     _HIGH_Y_START,
 )
 
-# Default quantiles for compute_threshold_grid (D-11). Widened from the
-# original 8 (1/2/5/10/90/95/98/99th percentiles) to 14, adding resolution
-# between the 1st/99th (kept as the outermost points -- more extreme than
-# that starts running out of data at a 252-day window, ~2-3 points at the
-# 1st percentile already) and the median. Motivation: 8 free parameters
-# matched against exactly 8 threshold conditions is exactly determined, the
-# textbook recipe for a non-unique fit -- confirmed empirically, not just in
-# the abstract, by the gap against the independently published AAPL fit
-# noted above (same general method, very different parameter values, both
-# presumably tracking their own tail data reasonably). More conditions than
-# parameters (over-identification) is the standard fix; it does not
-# guarantee a unique optimum but gives the loss less freedom to be
-# indifferent between very different parameter vectors.
-DEFAULT_THRESHOLD_QUANTILES: tuple[float, ...] = (
-    0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15,
-    0.85, 0.90, 0.925, 0.95, 0.97, 0.98, 0.99,
+# Default quantiles for compute_threshold_grid (D-11): 15 per side, from the
+# 1st to the 45th percentile and the 55th to the 99th, so the grid spans the
+# whole return distribution as in Madan & Wang's Figure 1 (tail probabilities
+# up to ~0.5), with AD weights doing the job of emphasizing the small
+# probabilities. The earlier tails-only grid (14 points, 1-15% / 85-99%) never
+# saw the body of the distribution: on AAPL's 1033 days its fit had a
+# full-range tail-probability RMSE of 0.023, against 0.0040 for this grid and
+# 0.0047 for the paper's own Table 1 parameters. 30 conditions for 8
+# parameters also keeps the fit over-identified. Outermost points stay at
+# 1%/99%: past that a 252-day window runs out of data (~2-3 points).
+DEFAULT_THRESHOLD_QUANTILES: tuple[float, ...] = tuple(
+    float(q) for q in np.r_[np.linspace(0.01, 0.45, 15), np.linspace(0.55, 0.99, 15)]
 )
 
 
@@ -278,7 +271,12 @@ def empirical_tail_probabilities(returns, thresholds):
 
 def ad_weight(p_empirical):
     """Anderson-Darling weight 1/(p(1-p)), the mechanism that overweights
-    the extreme tails relative to the center (ADR-0005). p is clamped into
+    the extreme tails relative to the center (ADR-0005). Uniform weights
+    would fit only the large central probabilities. For *tail* probabilities
+    p never approaches 1 (P(X>t) for t>0 and P(X<t) for t<0 stay below
+    ~0.5), so only the p -> 0 end matters and the (1-p) factor is harmless --
+    Dr. Madan, 2026-10-19; (1-p) only bites when fitting plain CDF values.
+    p is clamped into
     [1e-6, 1-1e-6] before the weight: an observed 0-or-1 empirical tail
     probability at a threshold is a small-sample artifact, not infinite
     information. Exposed standalone so its tail-vs-center behavior can be

@@ -1,6 +1,6 @@
-# Q calibration: pin Cn, Cp, Yn, Yp; solve M from the martingale condition; no free drift
+# Q calibration: solve M from the martingale condition; pin Yn, Yp (and, under strict equivalence, Cn, Cp)
 
-Status: accepted (2026-10-18). Resolves the three Phase 1.5 questions left open by the 2026-08-07 meeting.
+Status: accepted (2026-10-18); default Q search revised to C_FREE after Dr. Madan's answers on 2026-10-19 (see the end of this ADR).
 
 **Pinning split (8 params).** Madan & Wang, "Asset Pricing, Measure Changes, and a New Lévy Model" (2026), Section 2: equivalence (finite Hellinger distance) forbids changing C and Y on either side. Cn, Cp, Yn, Yp are pinned at their P values; G, M, Wn, Wp move.
 
@@ -24,6 +24,11 @@ Status: accepted (2026-10-18). Resolves the three Phase 1.5 questions left open 
 - *Window.* The paper estimated on a fixed 1033-day window. On AAPL, 1033 days gives steadier P estimates (Y ~ 1.0-1.5 on both dates) than 252 days. A longer window alone does not rescue strict pinning, though (9.4 / 2.4 vol points).
 - *Martingale target and units.* The paper's r=q=0 is stated as preliminary, so the forward-based target stands. The 252x scaling of C is forced by psi being linear in C.
 
-Questions that remain for Dr. Madan: (1) since strict equivalence cannot fit the smile, is freeing Cn, Cp (his Markovian-paper relaxation) the intended Q step, given the draft expected G, M, Wn, Wp alone to be "rich enough for option data"? (2) Should the 252-day rolling window he confirmed on 2026-08-07 give way to a longer one, given 252 days do not pin down Y? (3) His Table 1 has Y ~ 0.003 for every stock, while our fits give Y ~ 1 on the same kind of data. Which estimator settings produced his values?
+**Resolved with Dr. Madan, 2026-10-19.**
+1. *Q step:* "keep it free for performance accuracy." The default Q fit is now `C_FREE`: Cn, Cp, G, Wn, Wp searched, Yn, Yp pinned at P, M from the martingale condition. This is his Markovian-paper relaxation. It is not strictly equivalent, so required returns come from eq. 36's kernel difference. `PINNED` (strictly equivalent) and `UNRESTRICTED` are still reported for comparison.
+2. *Window:* 1033 days estimates better, but traders don't use that many years. The 252-day rolling window stays (ADR-0003), and differing from the paper's window is fine.
+3. *Weighting:* AD weights are the recommendation, and he used them too: uniform weights would fit only the large central probabilities. For tail probabilities p never approaches 1, so only p -> 0 matters in 1/(p(1-p)); the (1-p) factor only bites when fitting plain CDF values. The gap to his Table 1 was therefore the threshold grid, not the weighting. With AD weights and a grid spanning the whole range (as in his Figure 1), AAPL's 1033-day fit reaches a full-range RMSE of 0.0040, against 0.0047 for his Table 1 values and 0.023 for our old tails-only grid. `pfit.DEFAULT_THRESHOLD_QUANTILES` is now 15 quantiles per side (1-45%, 55-99%).
 
-Consequence: `qfit.calibrate_q(search=PINNED)` is the deliverable; `search=UNRESTRICTED` is a diagnostic only (not equivalent to P) and is labelled as such everywhere it is reported.
+*Results after both changes (AAPL, 252-day window):* the P-fit lands in the paper's regime (Y ~ 0.04-0.06, Wn ~ 15 vs Wp ~ 5) on both dates. IV RMSE in vol points, 2023-01-13 / 2025-08-29: main `C_FREE` 0.97 / 0.74; strictly equivalent 6.3 / 9.0; martingale-only 6.2 / 7.7; unrestricted 0.42 / 0.14. On 2025-08-29 the main fit drives G to ~0.04 and leaves the down tail to the power tilt (Wn ~ 11) -- the power tilt doing the work the model was built for.
+
+Consequence: `qfit.calibrate_q` defaults to `search=C_FREE`; `PINNED` and `UNRESTRICTED` remain available and are labelled as comparisons wherever they are reported.
