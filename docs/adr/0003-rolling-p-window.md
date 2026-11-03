@@ -1,6 +1,6 @@
 # Re-fit the P-measure on a trailing 252-day window per quote date, not once per stock
 
-Status: accepted
+Status: accepted. The window rule stands; the "MLE loop" below is now the AD-weighted tail-probability fit (ADR-0005). Reconfirmed by Dr. Madan 2026-10-19: a longer window estimates better, but 252 days is what traders use.
 
 Considered fitting (C,G_P,M_P,Y,W_P) once per stock on the full ~2.6-year return history, which would be simpler and give more stable estimates of C,Y (the parameters the Hellinger condition treats as fixed, pathwise-observable quantities — arguably they *shouldn't* be regime-sensitive). Rejected in favor of a rolling trailing-252-trading-day window re-fit at each option quote date, to better match the professor's description of a live book-marking workflow and to let the model track regime shifts (e.g. NVDA's return distribution changed materially between 2023 and 2025).
 

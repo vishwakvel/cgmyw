@@ -7,3 +7,6 @@ __pycache__/
 .venv/
 venv/
 .planning/
+.pytest_cache/
+*.egg-info/
+outputs/

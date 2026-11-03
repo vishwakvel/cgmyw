@@ -1,6 +1,6 @@
 # CGMYW Option Pricing
 
-Empirical project: implement a 5-parameter Lévy jump model (CGMY extended with a shared power-law tilt), calibrate it to WRDS equity option data via FFT, and report estimation results.
+Empirical project: implement the 8-parameter CGMYW Lévy jump model (CGMY extended with a power-law tilt per tail), fit it to daily returns (P), calibrate it to WRDS equity option data via FFT (Q), and report estimation results.
 
 ## Language
 
@@ -9,11 +9,8 @@ The classical 4-parameter Lévy density (C, G, M, Y): exponential decay rate G o
 _Avoid_: Variance gamma (VG is the special case Y=0, not this model)
 
 **CGMYW** (this project's model):
-CGMY with one added shared power-law tilt parameter W, applied symmetrically to both tails: `k(x) = C·exp(-G|x|)/(|x|^(1+Y)(1+|x|)^W)` for x<0, mirrored with M for x>0. 5 parameters total: C, G, M, Y, W. This is the "new 5-parameter model" referred to in the project brief — a deliberately simplified, symmetric case of the fuller asymmetric model in the attached note (see ADR-0001).
-_Avoid_: "the new model" (ambiguous with the paper's full asymmetric version), "5-param CGMY" (drop — could be confused with plain CGMY)
-
-**Full asymmetric CGMYW**:
-The 8-parameter version from the attached note (Cn,Yn,Wn,G,Cp,Yp,Wp,M), where each tail gets independent C, Y, W. Not the initial implementation target — a possible later extension.
+CGMY with a power-law tilt per tail: `k(x) = Cn·exp(-G|x|)/(|x|^(1+Yn)(1+|x|)^Wn)` for x<0, `Cp·exp(-Mx)/(x^(1+Yp)(1+x)^Wp)` for x>0. 8 parameters (Cn,Cp,G,M,Yn,Yp,Wn,Wp), per ADR-0004 (supersedes ADR-0001's symmetric 5-parameter reading). Published as Madan & Wang, "Asset Pricing, Measure Changes, and a New Lévy Model" (2026).
+_Avoid_: "the new model", "5-param CGMYW" (superseded)
 
 **Lévy density** `k(x)`:
 Expected arrival rate of jumps of size in `[x, x+dx]` per unit time. Not a probability density — does not integrate to 1.
@@ -28,10 +25,10 @@ The physical/statistical measure, estimated from historical return time series.
 The risk-neutral measure, calibrated from option prices; discounted stock is a Q-martingale.
 
 **Hellinger condition**:
-The constraint that C and Y must be identical under P and Q for the two measures to be equivalent; only G, M (and here, W) are free to move between measures.
+The constraint that C and Y must be identical under P and Q for the two measures to be equivalent; here Cn, Cp, Yn, Yp are pinned and only G, M, Wn, Wp move (ADR-0008).
 
 **Kummer U** `U(a,b,z)`:
-Confluent hypergeometric function of the second kind (Tricomi function); appears in the CGMYW characteristic exponent because of the power-law tilt. Evaluated via `scipy.special.hyperu`.
+Confluent hypergeometric function of the second kind (Tricomi function); appears in the CGMYW characteristic exponent as U(W, W+Y+1, z) because of the power-law tilt. Evaluated at complex z via a hyp1f1/asymptotic reconstruction, since `scipy.special.hyperu` is real-only (ADR-0007).
 
 ## Data
 

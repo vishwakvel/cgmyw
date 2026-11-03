@@ -1,0 +1,37 @@
+[project]
+name = "cgmyw"
+version = "0.1.0"
+description = "8-parameter asymmetric CGMYW Levy jump model: P-then-Q calibration pipeline"
+readme = "CONTEXT.md"
+requires-python = ">=3.12"
+dependencies = [
+    # scipy>=1.14 is a hard floor, not cosmetic: scipy.special.hyp1f1's complex-argument
+    # support (which src/cgmyw/model.py's Kummer-U reconstruction depends on) was broken
+    # for complex z prior to 1.14.0 -- see scipy GitHub issue #20797.
+    "scipy>=1.14",
+    "numpy",
+    "matplotlib",
+    "yfinance",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "mpmath",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cgmyw"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "network: hits a real external network service, skipped by default",
+    "slow: multi-start optimizer runs, part of the default suite but flagged for future selective skipping",
+]
+addopts = "-q -m 'not network'"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
